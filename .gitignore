@@ -5,8 +5,8 @@ __pycache__/
 venv/
 .env
 .ipynb_checkpoints/
-data/*.parquet
-data/*.csv
+data/**
+!data/.gitkeep
 .pytest_cache/
 .ruff_cache/
 dist/

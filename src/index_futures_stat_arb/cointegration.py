@@ -41,9 +41,7 @@ def engle_granger(
 
 def adf_test(series: pd.Series, alpha: float = 0.05) -> dict:
     """Augmented Dickey-Fuller stationarity test."""
-    stat, pvalue, _nlag, _nobs, crit, _ic = adfuller(
-        series.dropna(), result_object=False
-    )
+    stat, pvalue, _nlag, _nobs, crit, _ic = adfuller(series.dropna(), result_object=False)
     return {
         "statistic": float(stat),
         "pvalue": float(pvalue),
@@ -60,9 +58,7 @@ class HedgeRatio:
     r_squared: float
 
 
-def estimate_hedge_ratio(
-    y: pd.Series, x: pd.Series, method: str = "ols"
-) -> HedgeRatio:
+def estimate_hedge_ratio(y: pd.Series, x: pd.Series, method: str = "ols") -> HedgeRatio:
     """Estimate ``y ~ alpha + beta * x``.
 
     ``method`` is ``"ols"`` (statsmodels OLS with constant) or ``"tls"``

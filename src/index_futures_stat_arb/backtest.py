@@ -21,18 +21,14 @@ class BacktestResult:
     metrics: dict[str, float]
 
 
-def performance_metrics(
-    pnl: pd.Series, periods_per_year: int = 252
-) -> dict[str, float]:
+def performance_metrics(pnl: pd.Series, periods_per_year: int = 252) -> dict[str, float]:
     """Total PnL, annualised Sharpe, max drawdown, hit rate, n_periods."""
     pnl = pnl.dropna()
     equity = pnl.cumsum()
     peak = equity.cummax()
     max_dd = float((peak - equity).max()) if len(equity) else 0.0
     std = float(pnl.std())
-    sharpe = (
-        float(pnl.mean() / std * np.sqrt(periods_per_year)) if std > 0 else 0.0
-    )
+    sharpe = float(pnl.mean() / std * np.sqrt(periods_per_year)) if std > 0 else 0.0
     nonzero = pnl[pnl != 0]
     hit_rate = float((nonzero > 0).mean()) if len(nonzero) else 0.0
     return {
@@ -104,25 +100,25 @@ def walk_forward_backtest(
     restricted to the test slice.
     """
     train, test = train_test_split_by_date(prices, split)
-    logp = np.log(prices)
-    log_train = np.log(train)
+    logp = prices.apply(np.log)
+    log_train = train.apply(np.log)
 
     hedge = estimate_hedge_ratio(log_train[y_col], log_train[x_col], method="ols")
     spread = compute_spread(logp[y_col], logp[x_col], hedge.beta, hedge.alpha)
-    train_spread = compute_spread(
-        log_train[y_col], log_train[x_col], hedge.beta, hedge.alpha
-    )
+    train_spread = compute_spread(log_train[y_col], log_train[x_col], hedge.beta, hedge.alpha)
     ou = fit_ou(train_spread)
 
     z = zscore(spread, window=z_window)
     signals = generate_signals(z, entry=entry, exit=exit, stop=stop)
 
     train_bt = backtest_spread(
-        spread.loc[train.index], signals.loc[train.index],
+        spread.loc[train.index],
+        signals.loc[train.index],
         cost_per_unit=cost_per_unit,
     )
     test_bt = backtest_spread(
-        spread.loc[test.index], signals.loc[test.index],
+        spread.loc[test.index],
+        signals.loc[test.index],
         cost_per_unit=cost_per_unit,
     )
     return {

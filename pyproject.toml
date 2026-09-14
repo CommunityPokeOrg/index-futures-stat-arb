@@ -15,13 +15,17 @@ dependencies = [
     "scipy>=1.10",
     "statsmodels>=0.14",
     "matplotlib>=3.7",
+    "pyarrow>=14",
 ]
 
 [project.optional-dependencies]
 data = ["yfinance>=0.2.40"]
 databento = ["databento>=0.40"]
 notebook = ["jupyter>=1.0", "ipykernel>=6.25"]
-dev = ["pytest>=7.4", "ruff>=0.1"]
+dev = ["pytest>=7.4", "ruff>=0.1", "mypy>=1.8", "pandas-stubs"]
+
+[project.scripts]
+ifsa = "index_futures_stat_arb.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -31,3 +35,12 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+files = ["src"]

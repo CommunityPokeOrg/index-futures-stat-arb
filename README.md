@@ -34,59 +34,94 @@ cp .env.example .env   # fill in DATABENTO_API_KEY if using Databento
 
 ## Usage
 
-Open the research notebook:
+The reproducible command-line pipeline is configured with TOML files:
 
 ```bash
-jupyter notebook notebooks/es_nq_stat_arb_research.ipynb
+ifsa ingest --config configs/ingest_example.toml --offline --no-resume
+ifsa rolls --config configs/ingest_example.toml --rule volume \
+  --out data/reference/roll_calendar
+ifsa simulate --config configs/sim_synthetic.toml --offline --out data/results
 ```
 
-Or use the library directly:
-
-```python
-from index_futures_stat_arb import load_prices, walk_forward_backtest
-
-prices = load_prices(start="2018-01-01")          # yfinance ES=F / NQ=F
-results = walk_forward_backtest(prices, split=0.7)
-print(results["test"].metrics)
-```
+The original research helpers and notebooks remain available for exploratory
+cointegration, OU, and walk-forward work.
 
 ## Data
 
-Two ingestion paths are provided:
+The ingestion pipeline requests per-contract CME `ohlcv-1m` data, normalizes
+timestamps and prices, labels CME sessions/RTH, validates OHLC and duplicate
+keys, and writes zstd-compressed Hive-partitioned Parquet:
 
-- **yfinance proxies** (default): `ES=F` / `NQ=F` continuous front-month futures
-  tickers, falling back to `SPY` / `QQQ` ETFs if the futures tickers are
-  unavailable.
-- **Databento**: real CME Globex data via `DATABENTO_API_KEY` and
-  `DATABENTO_DATASET` (default `GLBX.MDP3`), using continuous contracts
-  (`stype_in="continuous"`).
+```text
+data/raw/source=<source>/dataset=<dataset>/schema=<schema>/
+  product=ES/contract=ESH6/date=YYYY-MM-DD/part-0.parquet
+```
 
-Caveats to keep in mind:
+Use `DATABENTO_API_KEY` in the environment for the real Databento path; keys
+are never written to manifests or logs. Chunk requests are session-aligned and
+resume from atomic checkpoints. Each completed dataset has a manifest containing
+the deterministic dataset ID, row count, configuration, and SHA-256 for every
+Parquet file. The offline `--offline` path uses clearly labelled deterministic
+synthetic fixtures and never accesses the network.
 
-- Continuous contracts have **roll artifacts**; the PnL of a naive spread is not
-  exactly tradable.
-- yfinance data quality is best-effort; expect gaps and occasional bad prints.
-- ETF proxies introduce **survivorship/tracking** differences vs futures.
-- No tick data — daily bars only, so intraday execution is not modelled.
+## Roll calendar and continuous series
+
+`ifsa rolls` builds explicit per-product calendars using calendar, volume,
+open-interest, or fixed-k rules. Volume and open-interest decisions use only
+the prior completed session, include an earliest-roll constraint, and have a
+CME-Monday calendar guard. ES and NQ calendars are joined so the joint roll
+date is visible in `es.parquet`, `nq.parquet`, and `joint.parquet`.
+
+`build_continuous` supports none, Panama, and ratio adjustments, with
+as-of-dated and forward-adjusted modes. Simulation uses forward adjustment so
+historical prices do not change when later rolls are discovered.
+
+## Simulation
+
+`ifsa simulate` loads aligned ES/NQ bars, resamples 1-minute data (default
+5-minute bars), optionally filters RTH, fits a log-price hedge ratio using only
+completed sessions, and runs an incremental signal/execution loop. A decision
+made at bar `i` close fills at bar `i + signal_lag_bars` open, then marks at the
+bar close. Roll close/reopen trades occur on the first bar of a roll session.
+Costs include configurable commission, exchange fees, tick slippage, and
+half-spread assumptions. Fixed-contract, dollar-neutral, and volatility-target
+sizers are available.
+
+The engine has a cursor-based future-access guard and the test suite includes
+deterministic no-lookahead checks. A run writes `report.json`, `trades.csv`,
+`equity.csv`, and `daily.csv` below a timestamp/config-hash run directory.
+
+Synthetic output is for pipeline and test validation only. It is **not evidence
+of a tradeable edge**, realistic market impact, or expected live performance.
 
 ## Project layout
 
-```
-data/                       # local data artifacts (gitignored)
-notebooks/                  # research notebooks
-src/index_futures_stat_arb/ # library: data, cointegration, ou, signals, backtest
-tests/                      # pytest suite (offline, synthetic data)
+```text
+configs/                    # ingestion, roll, and simulation TOML
+data/                       # local artifacts, manifests, and checkpoints
+src/index_futures_stat_arb/ # ingestion, contracts, rolls, continuous, execution
+tests/                      # offline unit and integration tests
 ```
 
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
 pytest -q
 ruff check src tests
+ruff format --check src tests
+mypy src
 ```
 
-All tests run offline against synthetic cointegrated data; no network required.
+All tests are offline and use deterministic fixtures or hand-built bars.
+
+## Limitations
+
+- No live Databento run is performed in this environment.
+- The CME holiday calendar is an explicit approximation; early closes are not
+  modelled.
+- The default one-tick slippage and half-spread values are assumptions.
+- Intrabar fills, limit orders, and queue position are not modelled.
+- Daily settlement differs from close-to-close marking and is not modelled.
 
 ## Risk disclaimer
 

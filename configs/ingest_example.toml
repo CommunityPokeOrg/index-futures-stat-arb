@@ -1,0 +1,13 @@
+[ingest]
+symbols = ["ESH6", "ESM6", "NQH6", "NQM6"]
+start = "2026-01-05"
+end = "2026-03-20"
+chunk_days = 1
+
+[rolls]
+rule = "volume"
+fixed_k_days = 8
+earliest_bdays_before_expiry = 10
+latest_rule = "cme_monday"
+one_way = true
+hysteresis_ratio = 1.0

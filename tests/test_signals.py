@@ -31,9 +31,7 @@ def test_generate_signals_transitions():
     # long entry at -2.1, exit at 0.4, short entry at 2.1, exit at -0.3,
     # stop at 4.1 -> flat, stay flat until |z|<exit (cleared at -0.2),
     # then re-enter long at -2.5.
-    z = pd.Series(
-        [0.0, -2.1, -1.0, 0.4, 0.0, 2.1, 1.0, -0.3, 4.1, 3.0, -0.2, -2.5]
-    )
+    z = pd.Series([0.0, -2.1, -1.0, 0.4, 0.0, 2.1, 1.0, -0.3, 4.1, 3.0, -0.2, -2.5])
     pos = signals.generate_signals(z, entry=2.0, exit=0.5, stop=4.0)
     expected = [0, 1, 1, 0, 0, -1, -1, 0, 0, 0, 0, 1]
     assert pos.tolist() == expected

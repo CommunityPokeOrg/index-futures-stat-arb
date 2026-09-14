@@ -53,9 +53,7 @@ def fit_ou(spread: pd.Series | np.ndarray, dt: float = 1.0) -> OUParams:
 
     theta = -math.log(b) / dt
     mu = a / (1 - b)
-    sigma = float(np.std(eps, ddof=1)) * math.sqrt(
-        -2 * math.log(b) / (dt * (1 - b**2))
-    )
+    sigma = float(np.std(eps, ddof=1)) * math.sqrt(-2 * math.log(b) / (dt * (1 - b**2)))
     return OUParams(theta=theta, mu=mu, sigma=sigma, dt=dt)
 
 

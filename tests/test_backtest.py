@@ -54,12 +54,8 @@ def test_train_test_split_by_fraction_and_date():
 
 
 def test_walk_forward_backtest_keys_and_lengths():
-    prices = data.generate_synthetic_pair(
-        n=2000, seed=0, sigma_spread=0.05, sigma_common=0.02
-    )
-    out = bt.walk_forward_backtest(
-        prices, split=0.7, z_window=60, entry=2.0, exit=0.5, stop=4.0
-    )
+    prices = data.generate_synthetic_pair(n=2000, seed=0, sigma_spread=0.05, sigma_common=0.02)
+    out = bt.walk_forward_backtest(prices, split=0.7, z_window=60, entry=2.0, exit=0.5, stop=4.0)
     for key in ("hedge", "ou", "train", "test", "spread", "zscore"):
         assert key in out
     train, test = bt.train_test_split_by_date(prices, 0.7)

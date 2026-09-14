@@ -30,8 +30,7 @@ def test_align_and_clean_removes_dupes_and_nonpositive():
 def test_align_and_clean_limits_ffill():
     idx = pd.bdate_range("2024-01-01", periods=6)
     df = pd.DataFrame(
-        {"ES": [100.0, np.nan, np.nan, np.nan, np.nan, 105.0],
-         "NQ": [50.0] * 6},
+        {"ES": [100.0, np.nan, np.nan, np.nan, np.nan, 105.0], "NQ": [50.0] * 6},
         index=idx,
     )
     clean = data.align_and_clean(df, ffill_limit=2)

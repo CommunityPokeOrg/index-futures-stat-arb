@@ -1,0 +1,41 @@
+[ingest]
+symbols = ["ESH6", "ESM6", "NQH6", "NQM6"]
+start = "2026-01-05"
+end = "2026-03-20"
+chunk_days = 1
+data_root = "data"
+
+[simulation]
+products = ["ES", "NQ"]
+start = "2026-01-05"
+end = "2026-03-20"
+bar_minutes = 5
+rth_only = true
+signal_lag_bars = 1
+z_window = 78
+entry = 2.0
+exit = 0.5
+stop = 4.0
+hedge_lookback_sessions = 10
+min_hedge_sessions = 5
+mask_roll_sessions = true
+adjust = "panama"
+
+[costs]
+commission_per_contract_usd = 1.25
+exchange_fees_per_contract_usd = 1.38
+slippage_ticks = 1.0
+half_spread_ticks = 0.5
+
+[sizer]
+name = "dollar_neutral"
+es_contracts = 2
+max_contracts = 20
+
+[rolls]
+rule = "volume"
+fixed_k_days = 8
+earliest_bdays_before_expiry = 10
+latest_rule = "cme_monday"
+one_way = true
+hysteresis_ratio = 1.0

@@ -274,13 +274,13 @@ Scores 1 (poor) – 5 (good); weights reflect a research project whose priority 
 
 | Step | Deliverable | Depends on |
 |---|---|---|
-| I-1 | `src/index_futures_stat_arb/schema.py`: PyArrow schemas for bars, contracts, roll calendar; manifest dataclass + JSON round-trip | this RFC |
-| I-2 | `ingest/databento.py`: pull `ohlcv-1m` for `ES.v.0`/`NQ.v.0` **and** per-contract `raw_symbol` for the window; write Hive-partitioned zstd Parquet + manifest; env-var key only | I-1, Databento credit |
-| I-3 | `ingest/yfinance.py`: adapt existing `fetch_yfinance` to the same schema (`contract=UNKNOWN`), 1d + ≤ 60-day 1m | I-1 |
-| I-4 | `reference/rolls.py`: roll-calendar builder for `c`, `v`, `n`, `fixed_k` with one-way + calendar guard; joint ES/NQ roll | I-2 |
-| I-5 | `continuous.py`: Panama / ratio / unadjusted views, as-of dated, forward- and back-adjust | I-4 |
-| I-6 | Loader: DuckDB/Polars read with 1m → 5m resampling, RTH filter, ES↔NQ alignment on `ts_event` | I-1 |
-| I-7 | Tests from §2.5 plus Issue #1 ingestion tests (date-range, missing/duplicate bars, sorting, tz normalisation, source parity, Parquet round-trip, checksum) — using small committed fixtures | I-2…I-6 |
+| I-1 | `src/index_futures_stat_arb/schema.py`: PyArrow schemas for bars, contracts, roll calendar; manifest dataclass + JSON round-trip | implemented (this PR) |
+| I-2 | `ingest/databento.py`: pull `ohlcv-1m` for `ES.v.0`/`NQ.v.0` **and** per-contract `raw_symbol` for the window; write Hive-partitioned zstd Parquet + manifest; env-var key only | implemented (this PR) |
+| I-3 | `ingest/yfinance.py`: adapt existing `fetch_yfinance` to the same schema (`contract=UNKNOWN`), 1d + ≤ 60-day 1m | implemented (this PR) |
+| I-4 | `reference/rolls.py`: roll-calendar builder for `c`, `v`, `n`, `fixed_k` with one-way + calendar guard; joint ES/NQ roll | implemented (this PR) |
+| I-5 | `continuous.py`: Panama / ratio / unadjusted views, as-of dated, forward- and back-adjust | implemented (this PR) |
+| I-6 | Loader: DuckDB/Polars read with 1m → 5m resampling, RTH filter, ES↔NQ alignment on `ts_event` | implemented (this PR) |
+| I-7 | Tests from §2.5 plus Issue #1 ingestion tests (date-range, missing/duplicate bars, sorting, tz normalisation, source parity, Parquet round-trip, checksum) — using small committed fixtures | implemented (this PR) |
 | I-8 | Resolve OQ-1…OQ-8; update this RFC's [A] items to [V] or drop them | — |
 
 Estimated effort: I-1…I-7 is roughly one focused session once Databento credentials are provisioned (`DATABENTO_API_KEY` in `.env`, never committed).

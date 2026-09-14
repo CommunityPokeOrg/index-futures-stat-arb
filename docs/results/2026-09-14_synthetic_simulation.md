@@ -46,7 +46,7 @@ the `[expiry − 10 bd, CME Monday]` window. The joint roll is the later of the 
   $1.25 commission + $1.38 exchange fees per contract per side.
 - Sizing: dollar-neutral, 2 ES contracts, NQ contracts from the hedge ratio (cap 20).
 - Prices forward-Panama-adjusted; roll trades booked at the open of the first roll-session bar.
-- Initial capital $250,000; seed 0.
+- The recorded run used initial capital $250,000; the current default is $1,000,000; seed 0.
 
 ## Results
 

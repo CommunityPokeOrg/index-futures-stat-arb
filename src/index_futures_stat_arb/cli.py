@@ -7,6 +7,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     simulate_yahoo.add_argument("--out", required=True, type=Path)
     simulate_yahoo.add_argument("--no-cache", action="store_true")
     simulate_yahoo.add_argument("--offline-fixture", type=Path)
+    compare = subparsers.add_parser("compare")
+    compare.add_argument("--runs", nargs="+", type=Path, required=True)
+    compare.add_argument("--out", required=True, type=Path)
     args = parser.parse_args(argv)
 
     if args.command == "ingest":
@@ -128,8 +132,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{args.out} row_count={len(continuous_result)}")
         return 0
     if args.command == "simulate":
-        from datetime import datetime, timezone
-
         from .contracts import list_contracts
         from .execution.engine import load_pair_bars, run_simulation
         from .fixtures import write_fixture_dataset
@@ -182,11 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         joint = joint_roll_calendar(calendars["ES"], calendars["NQ"])
         config_json = json.dumps(asdict(sim_config), default=str, sort_keys=True)
-        run_id = (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            + "-"
-            + hashlib.sha256(config_json.encode()).hexdigest()[:8]
-        )
+        run_id = _run_id(config_json)
         run_dir = args.out / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         report_path = _write_run(
@@ -207,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{key}: {value}")
         return 0
     if args.command == "simulate-yahoo":
-        from datetime import date, datetime, timezone
+        from datetime import date
 
         from .execution.engine import run_simulation
         from .ingest.yahoo import build_pair_bars, fetch_yahoo_bars
@@ -251,11 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         effective_start = metadata["ES"].get("effective_start", start.isoformat())
         effective_end = metadata["ES"].get("effective_end", end.isoformat())
         config_json = json.dumps(asdict(sim_config), default=str, sort_keys=True)
-        run_id = (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            + "-"
-            + hashlib.sha256(config_json.encode()).hexdigest()[:8]
-        )
+        run_id = _run_id(config_json)
         report_path = _write_run(
             args.out / run_id,
             sim_config,
@@ -278,6 +272,12 @@ def main(argv: list[str] | None = None) -> int:
         for key, value in simulation_result.metrics.items():
             print(f"{key}: {value}")
         return 0
+    if args.command == "compare":
+        table = _comparison_table(args.runs)
+        print(table)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(table + "\n")
+        return 0
     return 0
 
 
@@ -291,6 +291,7 @@ def _write_run(
     run_dir.mkdir(parents=True, exist_ok=True)
     result = simulation_result
     result.trades.to_csv(run_dir / "trades.csv", index=False)
+    result.signals.reset_index().to_csv(run_dir / "signals.csv", index=False)
     pd.DataFrame(
         {
             "ts_event": result.pnl.index,
@@ -322,3 +323,77 @@ def _git_sha() -> str:
         ).strip()
     except Exception:
         return "unknown"
+
+
+def _run_id(config_json: str) -> str:
+    return (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        + "-"
+        + hashlib.sha256(config_json.encode()).hexdigest()[:8]
+    )
+
+
+def _comparison_table(run_dirs: list[Path]) -> str:
+    headers = [
+        "label",
+        "data_source",
+        "data range",
+        "bars",
+        "hedge_method",
+        "threshold_mode",
+        "initial capital",
+        "net PnL",
+        "return %",
+        "annualized volatility",
+        "Sharpe",
+        "max drawdown %",
+        "round trips",
+        "win rate",
+        "average holding",
+        "fees",
+        "slippage",
+    ]
+    rows: list[list[str]] = []
+    for run_dir in run_dirs:
+        report = json.loads((run_dir / "report.json").read_text())
+        config = report.get("config", {})
+        metrics = report.get("metrics", {})
+        metadata = report.get("data_meta", {})
+        es_meta = metadata.get("ES", {}) if isinstance(metadata, dict) else {}
+        nq_meta = metadata.get("NQ", {}) if isinstance(metadata, dict) else {}
+        start = es_meta.get("effective_start", config.get("start", ""))
+        end = es_meta.get("effective_end", config.get("end", ""))
+        bars = es_meta.get("rows", nq_meta.get("rows", ""))
+        rows.append(
+            [
+                run_dir.name,
+                str(report.get("data_source", "")),
+                f"{start}..{end}",
+                str(bars),
+                str(config.get("hedge_method", "ols")),
+                str(config.get("threshold_mode", "fixed")),
+                _fmt(config.get("initial_capital_usd", "")),
+                _fmt(metrics.get("total_pnl_usd", "")),
+                _fmt(metrics.get("total_return_pct", "")),
+                _fmt(metrics.get("ann_vol_pct", "")),
+                _fmt(metrics.get("sharpe", "")),
+                _fmt(metrics.get("max_drawdown_pct", "")),
+                _fmt(metrics.get("n_round_trips", "")),
+                _fmt(metrics.get("win_rate", "")),
+                _fmt(metrics.get("avg_holding_bars", "")),
+                _fmt(metrics.get("total_fees_usd", "")),
+                _fmt(metrics.get("total_slippage_usd", "")),
+            ]
+        )
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _fmt(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)

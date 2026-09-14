@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from index_futures_stat_arb.cli import main
+from index_futures_stat_arb.config import load_simulation_config
 
 
 def _config(path: Path, root: Path) -> None:
@@ -51,6 +52,29 @@ def test_simulate_cli_metrics_are_deterministic(tmp_path: Path) -> None:
     main(["simulate", "--offline", "--config", str(config), "--out", str(out)])
     reports = sorted(out.glob("*/report.json"))
     assert json.loads(reports[-1].read_text())["metrics"] == first
+
+
+def test_compare_cli_preserves_run_order(tmp_path: Path) -> None:
+    config = tmp_path / "sim.toml"
+    _config(config, tmp_path)
+    out = tmp_path / "results"
+    main(["simulate", "--offline", "--config", str(config), "--out", str(out)])
+    main(["simulate", "--offline", "--config", str(config), "--out", str(out)])
+    runs = sorted(path.parent for path in out.glob("*/report.json"))
+    comparison = tmp_path / "comparison.md"
+    assert main(["compare", "--runs", str(runs[1]), str(runs[0]), "--out", str(comparison)]) == 0
+    text = comparison.read_text()
+    assert text.startswith("| label | data_source |")
+    assert text.index(runs[1].name) < text.index(runs[0].name)
+
+
+def test_simulation_configs_parse_refined_fields() -> None:
+    configs = Path("configs")
+    for path in configs.glob("sim_*.toml"):
+        config = load_simulation_config(path)
+        assert config.initial_capital_usd == 1_000_000.0
+        assert config.hedge_method in {"ols", "kalman", "rolling_eg"}
+        assert config.threshold_mode in {"fixed", "ou"}
 
 
 def test_ingest_and_rolls_smoke(tmp_path: Path) -> None:

@@ -37,7 +37,8 @@ ifsa simulate-yahoo --config configs/sim_yahoo_5m.toml    --out data/results
 Daily (`configs/sim_yahoo_daily.toml`): log-spread z-score over 60 sessions (window not reset
 per session), entry 2.0 / exit 0.5 / stop 4.0, hedge ratio OLS on prior 120 sessions (min 60),
 signal at close → fill at next session's open, 1 tick slippage + 0.5 tick half-spread,
-$1.25 + $1.38 per contract per side, dollar-neutral 2 ES vs hedge-ratio NQ, $250k capital.
+$1.25 + $1.38 per contract per side, dollar-neutral 2 ES vs hedge-ratio NQ. The recorded
+historical run used $250k capital; the current default is $1M.
 
 5-minute (`configs/sim_yahoo_5m.toml`): RTH only, 78-bar z window reset each session,
 hedge on prior 10 sessions (min 5), otherwise identical.

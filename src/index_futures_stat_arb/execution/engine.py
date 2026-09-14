@@ -11,11 +11,14 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 
+from ..cointegration import adf_test
 from ..continuous import Adjust, build_continuous
 from ..contracts import PRODUCTS, list_contracts
 from ..ingest.databento import read_partitioned
+from ..ou import fit_ou
 from ..rolls import RollConfig, build_roll_calendar, daily_from_bars, joint_roll_calendar
 from .costs import CostModel
+from .hedge import HedgeMethod, KalmanHedge, rolling_engle_granger
 from .metrics import compute_metrics
 from .sizing import Sizer, SizerSpec, SizerState, build_sizer
 
@@ -40,12 +43,27 @@ class SimulationConfig:
     min_hedge_sessions: int = 5
     mask_roll_sessions: bool = True
     z_reset_each_session: bool = True
+    hedge_method: HedgeMethod = "ols"
+    kalman_delta: float = 1e-5
+    kalman_obs_var: float = 1e-4
+    coint_pvalue_gate: float | None = None
+    threshold_mode: Literal["fixed", "ou"] = "fixed"
+    half_life_min_bars: float = 1.0
+    half_life_max_bars: float | None = None
+    max_holding_half_lives: float | None = None
+    ou_min_obs: int = 30
     adjust: Adjust = "panama"
     roll: RollConfig = field(default_factory=RollConfig)
-    initial_capital_usd: float = 250_000.0
+    initial_capital_usd: float = 1_000_000.0
     seed: int = 0
     costs: CostModel = field(default_factory=CostModel)
     sizer: SizerSpec = field(default_factory=SizerSpec)
+
+    def __post_init__(self) -> None:
+        if self.hedge_method not in {"ols", "kalman", "rolling_eg"}:
+            raise ValueError(f"unsupported hedge method: {self.hedge_method!r}")
+        if self.threshold_mode not in {"fixed", "ou"}:
+            raise ValueError(f"unsupported threshold mode: {self.threshold_mode!r}")
 
 
 @dataclass
@@ -69,10 +87,20 @@ class SignalState:
     position: int = 0
     stopped: bool = False
     last_event: str | None = None
+    max_holding_bars: float | None = None
+    bars_held: int = 0
 
     def update(self, value: float, allow_entry: bool = True) -> int:
         previous = self.position
         self.last_event = None
+        if self.position:
+            self.bars_held += 1
+            if self.max_holding_bars is not None and self.bars_held > self.max_holding_bars:
+                self.position = 0
+                self.last_event = "time_stop"
+                self.max_holding_bars = None
+                self.bars_held = 0
+                return 0
         if np.isnan(value):
             return self.position
         absolute = abs(value)
@@ -90,10 +118,14 @@ class SignalState:
         elif self.position == 0 and allow_entry:
             if value > self.entry:
                 self.position = -1
+                self.bars_held = 0
             elif value < -self.entry:
                 self.position = 1
+                self.bars_held = 0
         elif self.position and absolute < self.exit:
             self.position = 0
+            self.max_holding_bars = None
+            self.bars_held = 0
         if self.last_event is None and self.position != previous:
             self.last_event = _signal_event(previous, self.position)
         return self.position
@@ -219,9 +251,8 @@ def load_pair_bars(
 
 
 def _resample(frame: pd.DataFrame, minutes: int, rth_only: bool, product: str = "") -> pd.DataFrame:
+    del product
     frame = frame.copy()
-    if "roll_flag" not in frame:
-        frame["roll_flag"] = False
     if "roll_flag" not in frame:
         frame["roll_flag"] = False
     if rth_only:
@@ -274,20 +305,24 @@ def run_simulation(
     sizer: Sizer = build_sizer(cfg.sizer)
     state = SizerState()
     signal_state = SignalState(cfg.entry, cfg.exit, cfg.stop)
-    positions = []
+    positions: list[dict[str, object]] = []
     pnl_values: list[float] = []
-    equity_values: list[float] = []
-    signals = []
+    signals: list[dict[str, object]] = []
     trades: list[dict[str, object]] = []
-    hedge_rows = []
+    hedge_rows: list[dict[str, object]] = []
     pending: dict[int, tuple[int, int, str]] = {}
     held_es = held_nq = 0
     previous_es = previous_nq = 0.0
+    previous_beta = float("nan")
     alpha = beta = float("nan")
+    kalman: KalmanHedge | None = None
     session_spreads: list[float] = []
+    kalman_innovations: list[float] = []
     sessions = bars["session_date"].drop_duplicates().tolist()
     unit_session_pnl = 0.0
     previous_session: date | None = None
+    session_entry_gate = True
+    session_gate_reason: str | None = None
     for i in range(len(bars)):
         cursor.index = i
         row = cursor.at(i)
@@ -301,15 +336,64 @@ def run_simulation(
                 -cfg.hedge_lookback_sessions :
             ]
             history = bars[bars["session_date"].isin(prior_sessions)]
+            session_gate_reason = None
             if len(prior_sessions) >= cfg.min_hedge_sessions and len(history) >= 2:
                 x = np.log(history["nq_close"].to_numpy())
                 y = np.log(history["es_close"].to_numpy())
-                beta, alpha = np.polyfit(x, y, 1)
-                hedge_rows.append({"session_date": session, "alpha": alpha, "beta": beta})
+                if cfg.hedge_method == "rolling_eg":
+                    fit = rolling_engle_granger(y, x)
+                    alpha, beta, pvalue = fit.alpha, fit.beta, fit.pvalue
+                else:
+                    beta, alpha = np.polyfit(x, y, 1)
+                    pvalue = float("nan")
+                    if cfg.coint_pvalue_gate is not None:
+                        pvalue = rolling_engle_granger(y, x).pvalue
+                if cfg.hedge_method == "kalman":
+                    if kalman is None and np.isfinite(alpha + beta):
+                        kalman = KalmanHedge(
+                            delta=cfg.kalman_delta,
+                            obs_var=cfg.kalman_obs_var,
+                            beta=float(beta),
+                            alpha=float(alpha),
+                        )
+                    if kalman is not None:
+                        alpha, beta = kalman.alpha, kalman.beta
+                    if cfg.coint_pvalue_gate is not None:
+                        try:
+                            pvalue = adf_test(pd.Series(kalman_innovations[-cfg.z_window :]))[
+                                "pvalue"
+                            ]
+                        except Exception:
+                            pvalue = float("nan")
+                if cfg.coint_pvalue_gate is not None and (
+                    not np.isfinite(pvalue) or pvalue >= cfg.coint_pvalue_gate
+                ):
+                    session_entry_gate = False
+                    session_gate_reason = "cointegration"
+                else:
+                    session_entry_gate = True
+                if cfg.hedge_method != "kalman":
+                    hedge_rows.append(
+                        {
+                            "session_date": session,
+                            "alpha": alpha,
+                            "beta": beta,
+                            "pvalue": pvalue,
+                        }
+                    )
+                if cfg.hedge_method != "kalman" and not cfg.z_reset_each_session:
+                    prior_spreads = y - alpha - beta * x
+                    session_spreads = list(prior_spreads[-cfg.z_window :])
+                elif cfg.z_reset_each_session:
+                    session_spreads = []
             else:
                 alpha = beta = float("nan")
-            if cfg.z_reset_each_session:
-                session_spreads = []
+                session_entry_gate = False
+                session_gate_reason = "hedge_history"
+                if cfg.z_reset_each_session:
+                    session_spreads = []
+            if cfg.hedge_method == "kalman" and kalman is not None:
+                alpha, beta = kalman.alpha, kalman.beta
         trade_start = len(trades)
         if i in pending:
             target_es, target_nq, reason = pending.pop(i)
@@ -341,29 +425,92 @@ def run_simulation(
         )
         pnl_values.append(current_pnl)
         if i > 0:
+            hedge_unit = (
+                previous_beta
+                * previous_es
+                * PRODUCTS["ES"].multiplier_usd
+                / (previous_nq * PRODUCTS["NQ"].multiplier_usd)
+                if np.isfinite(previous_beta) and previous_nq
+                else 1.0
+            )
             unit_session_pnl += (float(row["es_close"]) - previous_es) * PRODUCTS[
                 "ES"
-            ].multiplier_usd - (float(row["nq_close"]) - previous_nq) * PRODUCTS[
+            ].multiplier_usd - hedge_unit * (float(row["nq_close"]) - previous_nq) * PRODUCTS[
                 "NQ"
             ].multiplier_usd
         previous_session = session
         previous_es, previous_nq = float(row["es_close"]), float(row["nq_close"])
-        equity_values.append(cfg.initial_capital_usd + sum(pnl_values))
-        spread = (
-            float(np.log(row["es_close"]) - alpha - beta * np.log(row["nq_close"]))
-            if np.isfinite(alpha + beta)
-            else float("nan")
-        )
+        log_es = float(np.log(row["es_close"]))
+        log_nq = float(np.log(row["nq_close"]))
+        if kalman is not None:
+            prediction, _innovation_var = kalman.predict(log_nq)
+            spread = log_es - prediction
+            kalman.update(log_es, log_nq)
+            alpha, beta = kalman.alpha, kalman.beta
+            kalman_innovations.append(spread)
+            hedge_rows.append(
+                {
+                    "session_date": session,
+                    "ts_event": row["ts_event"],
+                    "alpha": alpha,
+                    "beta": beta,
+                }
+            )
+        else:
+            spread = (
+                float(log_es - alpha - beta * log_nq) if np.isfinite(alpha + beta) else float("nan")
+            )
+        prior_window = np.asarray(session_spreads[-cfg.z_window :], dtype=float)
+        half_life = float("nan")
+        ou_mu = float("nan")
+        ou_sigma = float("nan")
+        threshold_gate = True
+        if cfg.threshold_mode == "ou":
+            if len(prior_window) >= cfg.ou_min_obs:
+                try:
+                    params = fit_ou(prior_window, dt=1.0)
+                    half_life = params.half_life
+                    ou_mu = params.mu
+                    ou_sigma = params.stationary_std
+                    threshold_gate = (
+                        np.isfinite(half_life)
+                        and half_life >= cfg.half_life_min_bars
+                        and (cfg.half_life_max_bars is None or half_life <= cfg.half_life_max_bars)
+                        and np.isfinite(ou_mu)
+                        and np.isfinite(ou_sigma)
+                        and ou_sigma > 0
+                    )
+                    z = (spread - ou_mu) / ou_sigma if threshold_gate else float("nan")
+                except (ValueError, FloatingPointError):
+                    threshold_gate = False
+                    z = float("nan")
+            else:
+                threshold_gate = False
+                z = float("nan")
+        else:
+            current_window = np.asarray([*prior_window, spread], dtype=float)
+            finite_window = current_window[np.isfinite(current_window)]
+            if len(finite_window) > 1:
+                mean = float(np.mean(finite_window))
+                std = float(np.std(finite_window, ddof=1))
+                z = (spread - mean) / std if std > 0 else float("nan")
+            else:
+                z = float("nan")
         session_spreads.append(spread)
-        window = session_spreads[-cfg.z_window :]
-        z = (
-            (spread - np.nanmean(window)) / np.nanstd(window, ddof=1)
-            if len(window) > 1 and np.nanstd(window, ddof=1) > 0
-            else float("nan")
+        gate_reasons: list[str] = []
+        if not session_entry_gate:
+            gate_reasons.append(session_gate_reason or "cointegration")
+        if not threshold_gate:
+            gate_reasons.append("half_life")
+        allow_entry = (
+            session_entry_gate
+            and threshold_gate
+            and not (
+                cfg.mask_roll_sessions and (bool(row.get("es_roll")) or bool(row.get("nq_roll")))
+            )
         )
-        allow_entry = not (
-            cfg.mask_roll_sessions and (bool(row.get("es_roll")) or bool(row.get("nq_roll")))
-        )
+        gated = not allow_entry
+        gate_reason = ",".join(gate_reasons) if gate_reasons else None
         old_signal = signal_state.position
         signal = (
             signal_override[i]
@@ -373,6 +520,15 @@ def run_simulation(
         if signal_override is not None:
             signal_state.last_event = _signal_event(old_signal, signal)
             signal_state.position = signal
+        if (
+            signal_override is None
+            and old_signal == 0
+            and signal
+            and cfg.max_holding_half_lives is not None
+            and np.isfinite(half_life)
+        ):
+            signal_state.max_holding_bars = cfg.max_holding_half_lives * half_life
+            signal_state.bars_held = 0
         if (np.isfinite(beta) or signal_override is not None) and signal != old_signal:
             sizing_beta = beta if np.isfinite(beta) else 1.0
             target = sizer.size(
@@ -384,8 +540,22 @@ def run_simulation(
             )
             reason = signal_state.last_event or _signal_event(old_signal, signal) or "exit"
             pending[i + cfg.signal_lag_bars] = (*target, reason)
-        signals.append({"ts_event": row["ts_event"], "z": z, "spread": spread, "signal": signal})
+        signals.append(
+            {
+                "ts_event": row["ts_event"],
+                "session_date": session,
+                "z": z,
+                "spread": spread,
+                "signal": signal,
+                "half_life": half_life,
+                "ou_mu": ou_mu,
+                "ou_sigma": ou_sigma,
+                "gated_bars": gated,
+                "gate_reason": gate_reason,
+            }
+        )
         positions.append({"ts_event": row["ts_event"], "n_es": held_es, "n_nq": held_nq})
+        previous_beta = beta
     if held_es or held_nq:
         row = bars.iloc[-1].copy()
         row["es_open"] = row["es_close"]
@@ -402,7 +572,20 @@ def run_simulation(
     equity = cfg.initial_capital_usd + pnl.cumsum()
     daily = pnl.groupby(bars["session_date"].to_numpy()).sum()
     trade_frame = pd.DataFrame(trades)
+    signal_frame = pd.DataFrame(signals).set_index("ts_event")
     metrics = compute_metrics(pnl, daily, trade_frame, position_frame, cfg.initial_capital_usd)
+    gated_sessions = signal_frame.groupby("session_date")["gated_bars"].any()
+    metrics["entry_gated_fraction"] = float(gated_sessions.mean()) if len(gated_sessions) else 0.0
+    reasons = signal_frame["gate_reason"].fillna("")
+    metrics["cointegration_gated_fraction"] = (
+        float(reasons.str.contains("cointegration").mean()) if len(reasons) else 0.0
+    )
+    metrics["hedge_history_gated_fraction"] = (
+        float(reasons.str.contains("hedge_history").mean()) if len(reasons) else 0.0
+    )
+    metrics["half_life_gated_fraction"] = (
+        float(reasons.str.contains("half_life").mean()) if len(reasons) else 0.0
+    )
     return SimulationResult(
         position_frame,
         pnl,
@@ -412,7 +595,7 @@ def run_simulation(
         metrics,
         cfg,
         pd.DataFrame(hedge_rows),
-        pd.DataFrame(signals).set_index("ts_event"),
+        signal_frame,
     )
 
 

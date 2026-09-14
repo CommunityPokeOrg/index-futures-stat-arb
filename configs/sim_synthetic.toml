@@ -9,6 +9,7 @@ data_root = "data"
 products = ["ES", "NQ"]
 start = "2026-01-05"
 end = "2026-03-20"
+initial_capital_usd = 1000000.0
 bar_minutes = 5
 rth_only = true
 signal_lag_bars = 1

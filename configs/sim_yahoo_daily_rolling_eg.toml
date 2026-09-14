@@ -1,4 +1,4 @@
-# REAL Yahoo data: continuous front-month prices; retention limits apply.
+# REAL Yahoo data: continuous front-month prices; Yahoo retention limits apply.
 [simulation]
 start = "2015-01-01"
 end = "2026-09-14"
@@ -15,6 +15,9 @@ min_hedge_sessions = 60
 mask_roll_sessions = false
 adjust = "none"
 z_reset_each_session = false
+hedge_method = "rolling_eg"
+coint_pvalue_gate = 0.10
+threshold_mode = "fixed"
 
 [costs]
 commission_per_contract_usd = 1.25
@@ -24,8 +27,8 @@ half_spread_ticks = 0.5
 
 [sizer]
 name = "dollar_neutral"
-es_contracts = 2
-max_contracts = 20
+es_contracts = 1
+max_contracts = 50
 
 [yahoo]
 interval = "1d"

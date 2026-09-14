@@ -104,7 +104,9 @@ def build_sizer(spec: SizerSpec) -> Sizer:
     if spec.name == "vol_target":
         inner = kwargs.pop("inner", FixedContracts())
         if isinstance(inner, dict):
-            inner = build_sizer(SizerSpec(**inner))
+            inner_name = str(inner.get("name", "fixed"))
+            inner_kwargs = {key: value for key, value in inner.items() if key != "name"}
+            inner = build_sizer(SizerSpec(name=inner_name, kwargs=inner_kwargs))
         if not hasattr(inner, "size"):
             raise TypeError("inner must implement Sizer")
         return VolTargetSizer(

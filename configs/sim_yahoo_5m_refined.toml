@@ -1,4 +1,4 @@
-# REAL Yahoo data: continuous front-month prices; retention limits apply.
+# REAL Yahoo data: continuous front-month prices; Yahoo retention limits apply.
 [simulation]
 start = "2026-07-20"
 end = "2026-09-14"
@@ -15,6 +15,15 @@ min_hedge_sessions = 5
 mask_roll_sessions = false
 adjust = "none"
 z_reset_each_session = true
+hedge_method = "kalman"
+kalman_delta = 1e-5
+kalman_obs_var = 1e-4
+coint_pvalue_gate = 0.10
+threshold_mode = "ou"
+half_life_min_bars = 1.0
+half_life_max_bars = 78.0
+max_holding_half_lives = 2.0
+ou_min_obs = 40
 
 [costs]
 commission_per_contract_usd = 1.25
@@ -23,9 +32,15 @@ slippage_ticks = 1.0
 half_spread_ticks = 0.5
 
 [sizer]
+name = "vol_target"
+target_daily_vol_usd = 5000.0
+lookback_sessions = 10
+max_contracts = 50
+
+[sizer.inner]
 name = "dollar_neutral"
-es_contracts = 2
-max_contracts = 20
+es_contracts = 1
+max_contracts = 50
 
 [yahoo]
 interval = "5m"

@@ -67,6 +67,20 @@ def test_build_sizer(name: str) -> None:
     assert build_sizer(SizerSpec(name=name)).size(1, 5000.0, 18000.0, 0.75, SizerState())[0] > 0
 
 
+def test_build_sizer_nested_inner() -> None:
+    sizer = build_sizer(
+        SizerSpec(
+            name="vol_target",
+            kwargs={
+                "target_daily_vol_usd": 5000.0,
+                "inner": {"name": "dollar_neutral", "es_contracts": 1, "max_contracts": 50},
+            },
+        )
+    )
+    assert isinstance(sizer, VolTargetSizer)
+    assert sizer.inner.size(1, 5000.0, 18000.0, 0.75, SizerState()) == (1, -1)
+
+
 def test_unknown_sizer_raises() -> None:
     with pytest.raises(ValueError, match="unknown"):
         build_sizer(SizerSpec(name="unknown"))

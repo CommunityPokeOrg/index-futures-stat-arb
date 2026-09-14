@@ -125,6 +125,17 @@ Reports identify the source explicitly with `data_source` and include the
 effective range and fetch metadata. Synthetic and Yahoo results must not be
 treated as interchangeable evidence of a tradeable edge.
 
+## Refined execution methods
+
+The execution engine supports fixed session OLS, a random-walk Kalman hedge,
+and rolling Engle–Granger hedge estimates. Optional cointegration and OU
+half-life gates block new entries when the fitted relationship is not usable;
+exits, stops, roll handling, and delayed fills remain active. OU threshold mode
+adapts the spread mean and stationary scale without tuning thresholds for
+profitability. Reports record hedge estimates, gate reasons, OU diagnostics,
+and entry-gating fractions. Volatility targeting uses the prior-bar hedge ratio
+to estimate the PnL of a dollar-neutral ES/NQ unit.
+
 ## Project layout
 
 ```text

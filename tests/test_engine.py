@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -175,3 +176,123 @@ def test_lookahead_utility_on_small_bars() -> None:
         cut_index=10,
         rng=None,
     )
+
+
+def _spread_bars(spread: np.ndarray, bars_per_session: int = 10) -> pd.DataFrame:
+    rows = []
+    for index, value in enumerate(spread):
+        nq = 18_000.0 + np.sin(index / 4.0) * 100.0
+        es = float(np.exp(np.log(nq) * 0.75 + value))
+        session = pd.Timestamp("2026-01-05").date() + pd.Timedelta(days=index // bars_per_session)
+        rows.append(
+            {
+                "ts_event": pd.Timestamp("2026-01-05", tz="UTC") + pd.Timedelta(minutes=5 * index),
+                "session_date": session,
+                "es_open": es,
+                "es_high": es + 1,
+                "es_low": es - 1,
+                "es_close": es,
+                "es_volume": 1,
+                "nq_open": nq,
+                "nq_high": nq + 1,
+                "nq_low": nq - 1,
+                "nq_close": nq,
+                "nq_volume": 1,
+                "es_contract": "ESH6",
+                "nq_contract": "NQH6",
+                "es_roll": False,
+                "nq_roll": False,
+                "es_close_raw": es,
+                "nq_close_raw": nq,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_ou_threshold_blocks_random_walk_and_accepts_ou() -> None:
+    rng = np.random.default_rng(4)
+    random_walk = np.arange(100, dtype=float) * 0.01
+    ou_spread = np.zeros(100)
+    for index in range(1, len(ou_spread)):
+        ou_spread[index] = 0.85 * ou_spread[index - 1] + rng.normal(0, 0.03)
+    ou_spread[60:] += 0.15
+    cfg = config(
+        min_hedge_sessions=2,
+        hedge_lookback_sessions=5,
+        z_window=30,
+        z_reset_each_session=False,
+        threshold_mode="ou",
+        ou_min_obs=20,
+        entry=1.0,
+        exit=0.2,
+    )
+    random_bars = _spread_bars(random_walk)
+    random_bars[["nq_open", "nq_high", "nq_low", "nq_close"]] = [
+        18_000.0,
+        18_001.0,
+        17_999.0,
+        18_000.0,
+    ]
+    random_result = run_simulation(random_bars, cfg)
+    ou_result = run_simulation(_spread_bars(ou_spread), cfg)
+    assert len(random_result.trades) == 0
+    assert ou_result.signals["half_life"].notna().any()
+    assert len(ou_result.trades) > 0
+
+
+def test_time_stop_has_distinct_reason() -> None:
+    rng = np.random.default_rng(4)
+    spread = np.zeros(100)
+    for index in range(1, len(spread)):
+        spread[index] = 0.85 * spread[index - 1] + rng.normal(0, 0.01)
+    spread[60:] += 0.15
+    cfg = config(
+        min_hedge_sessions=2,
+        hedge_lookback_sessions=5,
+        z_window=30,
+        z_reset_each_session=False,
+        threshold_mode="ou",
+        ou_min_obs=20,
+        entry=1.0,
+        exit=0.2,
+        max_holding_half_lives=0.5,
+    )
+    result = run_simulation(_spread_bars(spread), cfg)
+    assert "time_stop" in set(result.trades["reason"])
+
+
+def test_time_stop_is_unset_by_default() -> None:
+    rng = np.random.default_rng(4)
+    spread = np.zeros(100)
+    for index in range(1, len(spread)):
+        spread[index] = 0.85 * spread[index - 1] + rng.normal(0, 0.01)
+    spread[60:] += 0.15
+    result = run_simulation(
+        _spread_bars(spread),
+        config(
+            min_hedge_sessions=2,
+            hedge_lookback_sessions=5,
+            z_window=30,
+            z_reset_each_session=False,
+            threshold_mode="ou",
+            ou_min_obs=20,
+            entry=1.0,
+            exit=0.2,
+        ),
+    )
+    assert "time_stop" not in set(result.trades["reason"])
+
+
+def test_ols_residual_history_recomputed_after_refit() -> None:
+    bars = _spread_bars(np.sin(np.arange(80) / 3.0) * 0.01)
+    result = run_simulation(
+        bars,
+        config(
+            min_hedge_sessions=2,
+            hedge_lookback_sessions=3,
+            z_window=12,
+            z_reset_each_session=False,
+        ),
+    )
+    assert result.signals["z"].notna().any()
+    assert result.hedge_history["beta"].notna().all()

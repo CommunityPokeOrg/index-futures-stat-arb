@@ -86,7 +86,10 @@ def load_simulation_config(path: str | Path) -> Any:
         payload = tomllib.load(stream)
     values = dict(payload.get("simulation", {}))
     values["costs"] = CostModel(**payload.get("costs", {}))
-    sizer_values = payload.get("sizer", {})
+    sizer_values = dict(payload.get("sizer", {}))
+    nested_sizer = values.pop("sizer", None)
+    if isinstance(nested_sizer, dict):
+        sizer_values = {**sizer_values, **nested_sizer}
     values["sizer"] = SizerSpec(
         name=sizer_values.get("name", "fixed"),
         kwargs={key: value for key, value in sizer_values.items() if key != "name"},

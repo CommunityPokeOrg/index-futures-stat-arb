@@ -194,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             sim_config,
             simulation_result,
             {
+                "data_source": source,
                 "data_manifest_id": expected[0].stem if args.offline and expected else "unknown",
                 "roll_calendars": {
                     product: joint[product].to_dict(orient="records")

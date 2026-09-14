@@ -136,6 +136,12 @@ profitability. Reports record hedge estimates, gate reasons, OU diagnostics,
 and entry-gating fractions. Volatility targeting uses the prior-bar hedge ratio
 to estimate the PnL of a dollar-neutral ES/NQ unit.
 
+Method sources: Kalman hedge (Elliott, van der Hoek & Malcolm 2005; Chan 2013), OU
+s-scores and half-life thresholds (Avellaneda & Lee 2010; Bertram 2010; Leung & Li 2015,
+arXiv:1411.5062), cointegration gating (Engle & Granger 1987; Vidyamurthy 2004), survey
+(Krauss 2017). Real-data baseline-vs-refined evidence and limitations:
+`docs/results/2026-09-14_refined_method_real_data.md`.
+
 ## Project layout
 
 ```text

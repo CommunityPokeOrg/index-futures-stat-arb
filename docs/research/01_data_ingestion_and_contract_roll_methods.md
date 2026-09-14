@@ -285,6 +285,10 @@ Scores 1 (poor) – 5 (good); weights reflect a research project whose priority 
 
 Estimated effort: I-1…I-7 is roughly one focused session once Databento credentials are provisioned (`DATABENTO_API_KEY` in `.env`, never committed).
 
+Yahoo Finance is also supported as a keyless continuous-front-month source for
+real-data smoke tests; it does not provide per-contract volume for this roll
+calendar.
+
 ---
 
 ## 9. Sources

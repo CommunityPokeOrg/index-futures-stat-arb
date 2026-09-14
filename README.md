@@ -94,6 +94,37 @@ deterministic no-lookahead checks. A run writes `report.json`, `trades.csv`,
 Synthetic output is for pipeline and test validation only. It is **not evidence
 of a tradeable edge**, realistic market impact, or expected live performance.
 
+## Real data via Yahoo Finance (no API key)
+
+Yahoo's continuous front-month ES=F/NQ=F series can be fetched without an API
+key:
+
+```bash
+ifsa simulate-yahoo --config configs/sim_yahoo_daily.toml --out data/results
+ifsa simulate-yahoo --config configs/sim_yahoo_5m.toml --out data/results
+```
+
+Supported intervals and Yahoo retention limits are:
+
+| Interval | Maximum history | Maximum request span |
+|---|---:|---:|
+| 1m | 30 days | 7 days |
+| 2m, 5m, 15m, 30m | 60 days | 60 days |
+| 60m, 1h | 730 days | 730 days |
+| 1d | unlimited | unlimited |
+
+The adapter clips requests to these limits, splits long requests into bounded
+windows, validates bars, and caches Parquet plus metadata sidecars. Yahoo does
+not provide the per-contract volume needed for this project's explicit roll
+calendar, so these are Yahoo's own continuous contracts. Prices are unadjusted
+and may contain roll gaps, and Yahoo's roll timing is not necessarily the CME
+calendar used by the per-contract pipeline. In particular, 1-minute history is
+only approximately 30 days.
+
+Reports identify the source explicitly with `data_source` and include the
+effective range and fetch metadata. Synthetic and Yahoo results must not be
+treated as interchangeable evidence of a tradeable edge.
+
 ## Project layout
 
 ```text

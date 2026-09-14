@@ -39,6 +39,7 @@ class SimulationConfig:
     hedge_lookback_sessions: int = 10
     min_hedge_sessions: int = 5
     mask_roll_sessions: bool = True
+    z_reset_each_session: bool = True
     adjust: Adjust = "panama"
     roll: RollConfig = field(default_factory=RollConfig)
     initial_capital_usd: float = 250_000.0
@@ -307,7 +308,8 @@ def run_simulation(
                 hedge_rows.append({"session_date": session, "alpha": alpha, "beta": beta})
             else:
                 alpha = beta = float("nan")
-            session_spreads = []
+            if cfg.z_reset_each_session:
+                session_spreads = []
         trade_start = len(trades)
         if i in pending:
             target_es, target_nq, reason = pending.pop(i)

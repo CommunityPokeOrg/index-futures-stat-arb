@@ -22,7 +22,7 @@ dependencies = [
 data = ["yfinance>=0.2.40"]
 databento = ["databento>=0.40"]
 notebook = ["jupyter>=1.0", "ipykernel>=6.25"]
-dev = ["pytest>=7.4", "ruff>=0.1", "mypy>=1.8", "pandas-stubs"]
+dev = ["pytest>=7.4", "ruff>=0.1", "mypy>=1.8", "pandas-stubs", "yfinance>=0.2.40"]
 
 [project.scripts]
 ifsa = "index_futures_stat_arb.cli:main"
@@ -32,6 +32,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["network: hits live Yahoo endpoints"]
+addopts = "-m 'not network'"
 
 [tool.ruff]
 line-length = 100

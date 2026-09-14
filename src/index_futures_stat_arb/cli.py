@@ -8,10 +8,11 @@ import json
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from .config import load_config, load_roll_config
+from .config import load_config, load_roll_config, load_simulation_config, load_yahoo_config
 from .ingest import BarClient
 
 
@@ -36,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     simulate.add_argument("--config", required=True, type=Path)
     simulate.add_argument("--offline", action="store_true")
     simulate.add_argument("--out", required=True, type=Path)
+    simulate_yahoo = subparsers.add_parser("simulate-yahoo")
+    simulate_yahoo.add_argument("--config", required=True, type=Path)
+    simulate_yahoo.add_argument("--out", required=True, type=Path)
+    simulate_yahoo.add_argument("--no-cache", action="store_true")
+    simulate_yahoo.add_argument("--offline-fixture", type=Path)
     args = parser.parse_args(argv)
 
     if args.command == "ingest":
@@ -124,7 +130,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "simulate":
         from datetime import datetime, timezone
 
-        from .config import load_simulation_config
         from .contracts import list_contracts
         from .execution.engine import load_pair_bars, run_simulation
         from .fixtures import write_fixture_dataset
@@ -184,35 +189,129 @@ def main(argv: list[str] | None = None) -> int:
         )
         run_dir = args.out / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        simulation_result.trades.to_csv(run_dir / "trades.csv", index=False)
-        pd.DataFrame(
+        report_path = _write_run(
+            run_dir,
+            sim_config,
+            simulation_result,
             {
-                "ts_event": simulation_result.pnl.index,
-                "pnl": simulation_result.pnl.to_numpy(),
-                "equity": simulation_result.equity.to_numpy(),
-                "n_es": simulation_result.positions["n_es"].to_numpy(),
-                "n_nq": simulation_result.positions["n_nq"].to_numpy(),
-                "z": simulation_result.signals["z"].to_numpy(),
-            }
-        ).to_csv(run_dir / "equity.csv", index=False)
-        simulation_result.daily_pnl.rename("pnl").to_csv(run_dir / "daily.csv")
-        report = {
-            "config": asdict(sim_config),
-            "metrics": simulation_result.metrics,
-            "hedge_history": simulation_result.hedge_history.to_dict(orient="records"),
-            "git_sha": _git_sha(),
-            "package_version": "0.1.0",
-            "data_manifest_id": expected[0].stem if args.offline and expected else "unknown",
-            "roll_calendars": {
-                product: joint[product].to_dict(orient="records") for product in sim_config.products
+                "data_manifest_id": expected[0].stem if args.offline and expected else "unknown",
+                "roll_calendars": {
+                    product: joint[product].to_dict(orient="records")
+                    for product in sim_config.products
+                },
             },
-        }
-        (run_dir / "report.json").write_text(json.dumps(report, default=str, indent=2))
-        print(f"report={run_dir / 'report.json'}")
+        )
+        print(f"report={report_path}")
+        for key, value in simulation_result.metrics.items():
+            print(f"{key}: {value}")
+        return 0
+    if args.command == "simulate-yahoo":
+        from datetime import date, datetime, timezone
+
+        from .execution.engine import run_simulation
+        from .ingest.yahoo import build_pair_bars, fetch_yahoo_bars
+
+        sim_config = load_simulation_config(args.config)
+        yahoo_config = load_yahoo_config(args.config)
+        start = date.fromisoformat(sim_config.start[:10])
+        end = date.fromisoformat(sim_config.end[:10])
+        metadata: dict[str, dict[str, object]] = {}
+        frames: dict[str, pd.DataFrame] = {}
+        if args.offline_fixture:
+            for product in sim_config.products:
+                candidate = args.offline_fixture / f"{product.lower()}.parquet"
+                if not candidate.exists():
+                    candidate = args.offline_fixture / f"{product}.parquet"
+                frames[product] = pd.read_parquet(candidate)
+                metadata[product] = {
+                    "product": product,
+                    "interval": yahoo_config.interval,
+                    "rows": len(frames[product]),
+                    "cache_hit": True,
+                    "cache_path": str(candidate),
+                }
+        else:
+            for product in sim_config.products:
+                frames[product], metadata[product] = fetch_yahoo_bars(
+                    product,
+                    start,
+                    end,
+                    yahoo_config.interval,
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+        pair_bars = build_pair_bars(
+            frames["ES"],
+            frames["NQ"],
+            bar_minutes=yahoo_config.bar_minutes,
+            rth_only=yahoo_config.rth_only,
+        )
+        simulation_result = run_simulation(pair_bars, sim_config)
+        effective_start = metadata["ES"].get("effective_start", start.isoformat())
+        effective_end = metadata["ES"].get("effective_end", end.isoformat())
+        config_json = json.dumps(asdict(sim_config), default=str, sort_keys=True)
+        run_id = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + "-"
+            + hashlib.sha256(config_json.encode()).hexdigest()[:8]
+        )
+        report_path = _write_run(
+            args.out / run_id,
+            sim_config,
+            simulation_result,
+            {
+                "data_source": "yahoo",
+                "data_meta": metadata,
+                "roll_calendars": {},
+                "data_manifest_id": f"yahoo:{yahoo_config.interval}:"
+                f"{effective_start}:{effective_end}",
+            },
+        )
+        print(f"report={report_path}")
+        print(
+            f"data_source=yahoo interval={yahoo_config.interval} "
+            f"ES rows={metadata['ES'].get('rows', len(frames['ES']))} "
+            f"NQ rows={metadata['NQ'].get('rows', len(frames['NQ']))} "
+            f"range={effective_start}..{effective_end}"
+        )
         for key, value in simulation_result.metrics.items():
             print(f"{key}: {value}")
         return 0
     return 0
+
+
+def _write_run(
+    run_dir: Path,
+    sim_config: Any,
+    simulation_result: Any,
+    extra: dict[str, object],
+) -> Path:
+    """Write the common simulation artifacts and report."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    result = simulation_result
+    result.trades.to_csv(run_dir / "trades.csv", index=False)
+    pd.DataFrame(
+        {
+            "ts_event": result.pnl.index,
+            "pnl": result.pnl.to_numpy(),
+            "equity": result.equity.to_numpy(),
+            "n_es": result.positions["n_es"].to_numpy(),
+            "n_nq": result.positions["n_nq"].to_numpy(),
+            "z": result.signals["z"].to_numpy(),
+        }
+    ).to_csv(run_dir / "equity.csv", index=False)
+    result.daily_pnl.rename("pnl").to_csv(run_dir / "daily.csv")
+    report = {
+        "config": asdict(sim_config),
+        "metrics": result.metrics,
+        "hedge_history": result.hedge_history.to_dict(orient="records"),
+        "git_sha": _git_sha(),
+        "package_version": "0.1.0",
+        **extra,
+    }
+    report_path = run_dir / "report.json"
+    report_path.write_text(json.dumps(report, default=str, indent=2))
+    return report_path
 
 
 def _git_sha() -> str:

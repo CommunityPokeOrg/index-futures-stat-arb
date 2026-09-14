@@ -41,6 +41,17 @@ class IngestConfig:
         object.__setattr__(self, "data_root", Path(self.data_root))
 
 
+@dataclass(frozen=True)
+class YahooConfig:
+    interval: str = "1d"
+    cache_dir: Path = Path("data/yahoo")
+    bar_minutes: int | None = None
+    rth_only: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cache_dir", Path(self.cache_dir))
+
+
 def load_config(path: str | Path) -> IngestConfig:
     """Load an ``[ingest]`` TOML section."""
     with Path(path).open("rb") as stream:
@@ -84,3 +95,10 @@ def load_simulation_config(path: str | Path) -> Any:
     if "products" in values:
         values["products"] = tuple(values["products"])
     return SimulationConfig(**values)
+
+
+def load_yahoo_config(path: str | Path) -> YahooConfig:
+    """Load Yahoo adapter settings from the ``[yahoo]`` TOML section."""
+    with Path(path).open("rb") as stream:
+        values: dict[str, Any] = tomllib.load(stream).get("yahoo", {})
+    return YahooConfig(**values)

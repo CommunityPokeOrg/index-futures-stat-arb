@@ -65,6 +65,9 @@ def test_compare_cli_preserves_run_order(tmp_path: Path) -> None:
     assert main(["compare", "--runs", str(runs[1]), str(runs[0]), "--out", str(comparison)]) == 0
     text = comparison.read_text()
     assert text.startswith("| label | data_source |")
+    assert "entry_gated_fraction" in text
+    assert "$" in text
+    assert "%" in text
     assert text.index(runs[1].name) < text.index(runs[0].name)
 
 
@@ -75,6 +78,8 @@ def test_simulation_configs_parse_refined_fields() -> None:
         assert config.initial_capital_usd == 1_000_000.0
         assert config.hedge_method in {"ols", "kalman", "rolling_eg"}
         assert config.threshold_mode in {"fixed", "ou"}
+    legacy = load_simulation_config(configs / "sim_yahoo_daily_legacy.toml")
+    assert legacy.recompute_z_window_on_refit is False
 
 
 def test_ingest_and_rolls_smoke(tmp_path: Path) -> None:

@@ -1,0 +1,32 @@
+# REAL Yahoo data: continuous front-month prices; Yahoo retention limits apply.
+[simulation]
+start = "2015-01-01"
+end = "2026-09-14"
+initial_capital_usd = 1000000.0
+bar_minutes = 1
+rth_only = false
+signal_lag_bars = 1
+z_window = 60
+entry = 2.0
+exit = 0.5
+stop = 4.0
+hedge_lookback_sessions = 120
+min_hedge_sessions = 60
+mask_roll_sessions = false
+adjust = "none"
+z_reset_each_session = false
+recompute_z_window_on_refit = false
+
+[costs]
+commission_per_contract_usd = 1.25
+exchange_fees_per_contract_usd = 1.38
+slippage_ticks = 1.0
+half_spread_ticks = 0.5
+
+[sizer]
+name = "dollar_neutral"
+es_contracts = 2
+max_contracts = 20
+
+[yahoo]
+interval = "1d"

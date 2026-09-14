@@ -352,6 +352,7 @@ def _comparison_table(run_dirs: list[Path]) -> str:
         "average holding",
         "fees",
         "slippage",
+        "entry_gated_fraction",
     ]
     rows: list[list[str]] = []
     for run_dir in run_dirs:
@@ -372,17 +373,18 @@ def _comparison_table(run_dirs: list[Path]) -> str:
                 str(bars),
                 str(config.get("hedge_method", "ols")),
                 str(config.get("threshold_mode", "fixed")),
-                _fmt(config.get("initial_capital_usd", "")),
-                _fmt(metrics.get("total_pnl_usd", "")),
-                _fmt(metrics.get("total_return_pct", "")),
-                _fmt(metrics.get("ann_vol_pct", "")),
-                _fmt(metrics.get("sharpe", "")),
-                _fmt(metrics.get("max_drawdown_pct", "")),
+                _fmt(config.get("initial_capital_usd", ""), money=True),
+                _fmt(metrics.get("total_pnl_usd", ""), money=True),
+                _fmt(metrics.get("total_return_pct", ""), percent=True, percent_points=True),
+                _fmt(metrics.get("ann_vol_pct", ""), percent=True, percent_points=True),
+                _fmt(metrics.get("sharpe", ""), fixed_precision=2),
+                _fmt(metrics.get("max_drawdown_pct", ""), percent=True, percent_points=True),
                 _fmt(metrics.get("n_round_trips", "")),
-                _fmt(metrics.get("win_rate", "")),
+                _fmt(metrics.get("win_rate", ""), percent=True),
                 _fmt(metrics.get("avg_holding_bars", "")),
-                _fmt(metrics.get("total_fees_usd", "")),
-                _fmt(metrics.get("total_slippage_usd", "")),
+                _fmt(metrics.get("total_fees_usd", ""), money=True),
+                _fmt(metrics.get("total_slippage_usd", ""), money=True),
+                _fmt(metrics.get("entry_gated_fraction", ""), percent=True),
             ]
         )
     lines = [
@@ -393,7 +395,22 @@ def _comparison_table(run_dirs: list[Path]) -> str:
     return "\n".join(lines)
 
 
-def _fmt(value: object) -> str:
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    return str(value)
+def _fmt(
+    value: object,
+    percent: bool = False,
+    money: bool = False,
+    precision: int = 6,
+    percent_points: bool = False,
+    fixed_precision: int | None = None,
+) -> str:
+    if not isinstance(value, (float, int)):
+        return str(value)
+    if percent:
+        if percent_points:
+            return f"{float(value):.2f}%"
+        return f"{float(value):.2%}"
+    if money:
+        return f"${float(value):,.0f}"
+    if fixed_precision is not None:
+        return f"{float(value):.{fixed_precision}f}"
+    return f"{float(value):.{precision}g}"

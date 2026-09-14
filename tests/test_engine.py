@@ -83,6 +83,13 @@ def test_signal_state_stop_event() -> None:
     assert state.stopped
 
 
+def test_signal_state_time_stop_enters_cooldown() -> None:
+    state = SignalState(2.0, 0.5, 4.0, position=1, max_holding_bars=0)
+    assert state.update(1.0) == 0
+    assert state.last_event == "time_stop"
+    assert state.stopped
+
+
 def test_cursor_rejects_future_access() -> None:
     bars = make_bars(1, 2)
     cursor = _BarCursor(bars, index=0)
@@ -211,18 +218,21 @@ def _spread_bars(spread: np.ndarray, bars_per_session: int = 10) -> pd.DataFrame
 
 def test_ou_threshold_blocks_random_walk_and_accepts_ou() -> None:
     rng = np.random.default_rng(4)
-    random_walk = np.arange(100, dtype=float) * 0.01
-    ou_spread = np.zeros(100)
+    random_walk = np.arange(300, dtype=float) * 0.01
+    ou_spread = np.zeros(300)
+    decay = np.exp(-np.log(2) / 10.0)
     for index in range(1, len(ou_spread)):
-        ou_spread[index] = 0.85 * ou_spread[index - 1] + rng.normal(0, 0.03)
-    ou_spread[60:] += 0.15
+        ou_spread[index] = decay * ou_spread[index - 1] + rng.normal(0, 0.01)
     cfg = config(
         min_hedge_sessions=2,
         hedge_lookback_sessions=5,
-        z_window=30,
+        z_window=60,
         z_reset_each_session=False,
+        hedge_method="kalman",
         threshold_mode="ou",
-        ou_min_obs=20,
+        ou_min_obs=30,
+        half_life_min_bars=3.0,
+        half_life_max_bars=30.0,
         entry=1.0,
         exit=0.2,
     )
@@ -235,9 +245,32 @@ def test_ou_threshold_blocks_random_walk_and_accepts_ou() -> None:
     ]
     random_result = run_simulation(random_bars, cfg)
     ou_result = run_simulation(_spread_bars(ou_spread), cfg)
+    assert random_result.metrics["entry_gated_fraction"] > 0.9
     assert len(random_result.trades) == 0
-    assert ou_result.signals["half_life"].notna().any()
+    median_half_life = ou_result.signals["half_life"].dropna().median()
+    assert 3.0 <= median_half_life <= 30.0
     assert len(ou_result.trades) > 0
+
+
+def test_ou_gate_keeps_finite_z_when_half_life_invalid() -> None:
+    rng = np.random.default_rng(8)
+    spread = np.cumsum(rng.normal(0, 0.01, 300))
+    result = run_simulation(
+        _spread_bars(spread),
+        config(
+            min_hedge_sessions=2,
+            hedge_lookback_sessions=5,
+            z_window=60,
+            z_reset_each_session=False,
+            hedge_method="kalman",
+            threshold_mode="ou",
+            ou_min_obs=30,
+            half_life_min_bars=3.0,
+            half_life_max_bars=30.0,
+        ),
+    )
+    gated = result.signals["gate_reason"].fillna("").str.contains("half_life")
+    assert result.signals.loc[gated, "z"].notna().any()
 
 
 def test_time_stop_has_distinct_reason() -> None:
@@ -296,3 +329,28 @@ def test_ols_residual_history_recomputed_after_refit() -> None:
     )
     assert result.signals["z"].notna().any()
     assert result.hedge_history["beta"].notna().all()
+
+
+def test_legacy_mixed_window_flag_preserves_old_z_history() -> None:
+    bars = _spread_bars(np.sin(np.arange(120) / 3.0) * 0.01, bars_per_session=10)
+    common = config(
+        min_hedge_sessions=2,
+        hedge_lookback_sessions=3,
+        z_window=12,
+        z_reset_each_session=False,
+    )
+    recomputed = run_simulation(bars, common)
+    legacy = run_simulation(
+        bars,
+        SimulationConfig(
+            **{
+                **common.__dict__,
+                "recompute_z_window_on_refit": False,
+            }
+        ),
+    )
+    assert not np.allclose(
+        recomputed.signals["z"].to_numpy(),
+        legacy.signals["z"].to_numpy(),
+        equal_nan=True,
+    )

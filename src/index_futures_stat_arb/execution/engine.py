@@ -43,6 +43,7 @@ class SimulationConfig:
     min_hedge_sessions: int = 5
     mask_roll_sessions: bool = True
     z_reset_each_session: bool = True
+    recompute_z_window_on_refit: bool = True
     hedge_method: HedgeMethod = "ols"
     kalman_delta: float = 1e-5
     kalman_obs_var: float = 1e-4
@@ -98,6 +99,7 @@ class SignalState:
             if self.max_holding_bars is not None and self.bars_held > self.max_holding_bars:
                 self.position = 0
                 self.last_event = "time_stop"
+                self.stopped = True
                 self.max_holding_bars = None
                 self.bars_held = 0
                 return 0
@@ -317,12 +319,41 @@ def run_simulation(
     alpha = beta = float("nan")
     kalman: KalmanHedge | None = None
     session_spreads: list[float] = []
-    kalman_innovations: list[float] = []
+    log_es_history: list[float] = []
+    log_nq_history: list[float] = []
+    session_history: list[date] = []
     sessions = bars["session_date"].drop_duplicates().tolist()
     unit_session_pnl = 0.0
     previous_session: date | None = None
     session_entry_gate = True
     session_gate_reason: str | None = None
+
+    def state_window(state_alpha: float, state_beta: float, current_session: date) -> np.ndarray:
+        if cfg.z_reset_each_session:
+            indices = [
+                index
+                for index, history_session in enumerate(session_history)
+                if history_session == current_session
+            ]
+        else:
+            indices = list(range(len(log_es_history)))
+        if not indices:
+            return np.empty(0, dtype=float)
+        es_values = np.asarray([log_es_history[index] for index in indices], dtype=float)
+        nq_values = np.asarray([log_nq_history[index] for index in indices], dtype=float)
+        residuals = es_values - state_alpha - state_beta * nq_values
+        return residuals[-cfg.z_window :]
+
+    def sample_z(window: np.ndarray, current_spread: float) -> float:
+        values = np.asarray([*window, current_spread], dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) < 2 or not np.isfinite(current_spread):
+            return float("nan")
+        standard_deviation = float(np.std(values, ddof=1))
+        if standard_deviation <= 0 or not np.isfinite(standard_deviation):
+            return float("nan")
+        return float((current_spread - np.mean(values)) / standard_deviation)
+
     for i in range(len(bars)):
         cursor.index = i
         row = cursor.at(i)
@@ -360,9 +391,8 @@ def run_simulation(
                         alpha, beta = kalman.alpha, kalman.beta
                     if cfg.coint_pvalue_gate is not None:
                         try:
-                            pvalue = adf_test(pd.Series(kalman_innovations[-cfg.z_window :]))[
-                                "pvalue"
-                            ]
+                            gate_window = state_window(alpha, beta, session)
+                            pvalue = adf_test(pd.Series(gate_window))["pvalue"]
                         except Exception:
                             pvalue = float("nan")
                 if cfg.coint_pvalue_gate is not None and (
@@ -381,7 +411,11 @@ def run_simulation(
                             "pvalue": pvalue,
                         }
                     )
-                if cfg.hedge_method != "kalman" and not cfg.z_reset_each_session:
+                if (
+                    cfg.hedge_method != "kalman"
+                    and not cfg.z_reset_each_session
+                    and cfg.recompute_z_window_on_refit
+                ):
                     prior_spreads = y - alpha - beta * x
                     session_spreads = list(prior_spreads[-cfg.z_window :])
                 elif cfg.z_reset_each_session:
@@ -443,24 +477,15 @@ def run_simulation(
         log_es = float(np.log(row["es_close"]))
         log_nq = float(np.log(row["nq_close"]))
         if kalman is not None:
-            prediction, _innovation_var = kalman.predict(log_nq)
-            spread = log_es - prediction
-            kalman.update(log_es, log_nq)
-            alpha, beta = kalman.alpha, kalman.beta
-            kalman_innovations.append(spread)
-            hedge_rows.append(
-                {
-                    "session_date": session,
-                    "ts_event": row["ts_event"],
-                    "alpha": alpha,
-                    "beta": beta,
-                }
-            )
+            prior_alpha, prior_beta = kalman.alpha, kalman.beta
+            kalman.predict(log_nq)
+            spread = log_es - prior_alpha - prior_beta * log_nq
+            prior_window = state_window(prior_alpha, prior_beta, session)
         else:
             spread = (
                 float(log_es - alpha - beta * log_nq) if np.isfinite(alpha + beta) else float("nan")
             )
-        prior_window = np.asarray(session_spreads[-cfg.z_window :], dtype=float)
+            prior_window = np.asarray(session_spreads[-cfg.z_window :], dtype=float)
         half_life = float("nan")
         ou_mu = float("nan")
         ou_sigma = float("nan")
@@ -480,23 +505,34 @@ def run_simulation(
                         and np.isfinite(ou_sigma)
                         and ou_sigma > 0
                     )
-                    z = (spread - ou_mu) / ou_sigma if threshold_gate else float("nan")
+                    z = (
+                        float((spread - ou_mu) / ou_sigma)
+                        if np.isfinite(ou_mu) and np.isfinite(ou_sigma) and ou_sigma > 0
+                        else sample_z(prior_window, spread)
+                    )
                 except (ValueError, FloatingPointError):
                     threshold_gate = False
-                    z = float("nan")
+                    z = sample_z(prior_window, spread)
             else:
                 threshold_gate = False
-                z = float("nan")
+                z = sample_z(prior_window, spread)
         else:
-            current_window = np.asarray([*prior_window, spread], dtype=float)
-            finite_window = current_window[np.isfinite(current_window)]
-            if len(finite_window) > 1:
-                mean = float(np.mean(finite_window))
-                std = float(np.std(finite_window, ddof=1))
-                z = (spread - mean) / std if std > 0 else float("nan")
-            else:
-                z = float("nan")
+            z = sample_z(prior_window, spread)
         session_spreads.append(spread)
+        log_es_history.append(log_es)
+        log_nq_history.append(log_nq)
+        session_history.append(session)
+        if kalman is not None:
+            kalman.update(log_es, log_nq)
+            alpha, beta = kalman.alpha, kalman.beta
+            hedge_rows.append(
+                {
+                    "session_date": session,
+                    "ts_event": row["ts_event"],
+                    "alpha": alpha,
+                    "beta": beta,
+                }
+            )
         gate_reasons: list[str] = []
         if not session_entry_gate:
             gate_reasons.append(session_gate_reason or "cointegration")

@@ -16,6 +16,10 @@ class SizerState:
 
 
 class Sizer(Protocol):
+    def unit(
+        self, signal: int, es_price: float, nq_price: float, beta: float
+    ) -> tuple[float, float]: ...
+
     def size(
         self,
         signal: int,
@@ -31,6 +35,12 @@ class FixedContracts:
     n_es: int = 1
     n_nq: int = 1
 
+    def unit(
+        self, signal: int, es_price: float, nq_price: float, beta: float
+    ) -> tuple[float, float]:
+        del es_price, nq_price, beta
+        return float(signal * self.n_es), float(-signal * self.n_nq)
+
     def size(
         self, signal: int, es_price: float, nq_price: float, beta: float, state: SizerState
     ) -> tuple[int, int]:
@@ -43,22 +53,29 @@ class DollarNeutralSizer:
     es_contracts: int = 1
     max_contracts: int = 20
 
+    def unit(
+        self, signal: int, es_price: float, nq_price: float, beta: float
+    ) -> tuple[float, float]:
+        es = float(signal * abs(self.es_contracts))
+        nq = (
+            -signal
+            * abs(self.es_contracts)
+            * beta
+            * es_price
+            * PRODUCTS["ES"].multiplier_usd
+            / (nq_price * PRODUCTS["NQ"].multiplier_usd)
+        )
+        return es, nq
+
     def size(
         self, signal: int, es_price: float, nq_price: float, beta: float, state: SizerState
     ) -> tuple[int, int]:
         del state
         if signal == 0:
             return 0, 0
-        es = abs(self.es_contracts)
-        nq = round(
-            beta
-            * es
-            * es_price
-            * PRODUCTS["ES"].multiplier_usd
-            / (nq_price * PRODUCTS["NQ"].multiplier_usd)
-        )
-        nq = min(max(1, abs(nq)), self.max_contracts)
-        return signal * es, -signal * nq
+        es, nq = self.unit(signal, es_price, nq_price, beta)
+        nq_magnitude = min(max(1, round(abs(nq))), self.max_contracts)
+        return round(es), -signal * nq_magnitude
 
 
 @dataclass(frozen=True)
@@ -68,19 +85,31 @@ class VolTargetSizer:
     max_contracts: int = 20
     inner: Sizer = field(default_factory=FixedContracts)
 
+    def unit(
+        self, signal: int, es_price: float, nq_price: float, beta: float
+    ) -> tuple[float, float]:
+        return self.inner.unit(signal, es_price, nq_price, beta)
+
     def size(
         self, signal: int, es_price: float, nq_price: float, beta: float, state: SizerState
     ) -> tuple[int, int]:
-        base_es, base_nq = self.inner.size(signal, es_price, nq_price, beta, state)
+        unit_es, unit_nq = self.unit(signal, es_price, nq_price, beta)
+
+        def integerize(es: float, nq: float) -> tuple[int, int]:
+            return (
+                max(-self.max_contracts, min(self.max_contracts, round(es))),
+                max(-self.max_contracts, min(self.max_contracts, round(nq))),
+            )
+
         history = state.unit_pnl_daily.dropna().tail(self.lookback_sessions)
         if len(history) < self.lookback_sessions:
-            return base_es, base_nq
+            return integerize(unit_es, unit_nq)
         realized = float(history.std(ddof=1))
         if realized <= 0 or not pd.notna(realized):
-            return base_es, base_nq
+            return integerize(unit_es, unit_nq)
         scale = max(0.0, self.target_daily_vol_usd / realized)
-        scale = min(scale, self.max_contracts / max(abs(base_es), abs(base_nq), 1))
-        return round(base_es * scale), round(base_nq * scale)
+        scale = min(scale, self.max_contracts / max(abs(unit_es), abs(unit_nq), 1))
+        return integerize(unit_es * scale, unit_nq * scale)
 
 
 @dataclass(frozen=True)

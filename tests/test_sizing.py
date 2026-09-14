@@ -25,6 +25,11 @@ def test_dollar_neutral_cap() -> None:
     assert sizer.size(1, 5000.0, 18000.0, 10.0, SizerState()) == (10, -2)
 
 
+def test_dollar_neutral_unit_is_fractional() -> None:
+    sizer = DollarNeutralSizer(es_contracts=1)
+    assert sizer.unit(1, 2100.0, 4450.0, 0.75) == pytest.approx((1.0, -0.8848314607))
+
+
 def test_fixed_contracts() -> None:
     sizer = FixedContracts(n_es=3, n_nq=4)
     assert sizer.size(1, 1.0, 1.0, 1.0, SizerState()) == (3, -4)
@@ -60,6 +65,17 @@ def test_vol_target_respects_cap() -> None:
     )
     state = SizerState(pd.Series([1.0, 2.0]))
     assert sizer.size(1, 5000.0, 18000.0, 1.0, state) == (3, -3)
+
+
+def test_vol_target_scales_fractional_dollar_neutral_unit() -> None:
+    sizer = VolTargetSizer(
+        target_daily_vol_usd=18.384776310850235,
+        lookback_sessions=2,
+        max_contracts=50,
+        inner=DollarNeutralSizer(es_contracts=1, max_contracts=50),
+    )
+    state = SizerState(pd.Series([0.0, 1.0]))
+    assert sizer.size(1, 2100.0, 4450.0, 0.75, state) == (26, -23)
 
 
 @pytest.mark.parametrize("name", ["fixed", "dollar_neutral"])

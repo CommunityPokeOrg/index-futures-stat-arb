@@ -485,7 +485,7 @@ def run_simulation(
             spread = (
                 float(log_es - alpha - beta * log_nq) if np.isfinite(alpha + beta) else float("nan")
             )
-            prior_window = np.asarray(session_spreads[-cfg.z_window :], dtype=float)
+            prior_window = np.asarray(session_spreads[-(cfg.z_window - 1) :], dtype=float)
         half_life = float("nan")
         ou_mu = float("nan")
         ou_sigma = float("nan")

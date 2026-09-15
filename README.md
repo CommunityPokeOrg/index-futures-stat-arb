@@ -242,7 +242,10 @@ Enable once under **Settings → Pages → Source: GitHub Actions**; the site is
 
 ## Research plan
 
-`docs/research/next_steps_validation_protocol.md` records the current honest conclusion
+Index of research documents: `docs/research/README.md`. For local continuation start with
+`docs/research/02_consolidated_findings_and_local_continuation.md` (all produced metrics,
+Kalman/pairs engine specification, retail viability analysis, setup and commands, acceptance
+criteria). `docs/research/next_steps_validation_protocol.md` records the current honest conclusion
 (ES/SPY OOS Sharpe −0.16; NQ/QQQ 0.46, t ≈ 1.4; 5m uninformative), falsifiable hypotheses,
 and the validation protocol (untouched holdout, nested walk-forward, embargo, deflated
 Sharpe, parameter stability, cost/capacity stress, regime analysis, institutional-data

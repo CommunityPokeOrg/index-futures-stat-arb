@@ -14,7 +14,13 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
-from .config import load_config, load_roll_config, load_simulation_config, load_yahoo_config
+from .config import (
+    load_config,
+    load_roll_config,
+    load_simulation_config,
+    load_walkforward_config,
+    load_yahoo_config,
+)
 from .ingest import BarClient
 
 
@@ -49,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     diagnose_yahoo.add_argument("--out", required=True, type=Path)
     diagnose_yahoo.add_argument("--no-cache", action="store_true")
     diagnose_yahoo.add_argument("--offline-fixture", type=Path)
+    walkforward = subparsers.add_parser("walkforward")
+    walkforward.add_argument("--config", required=True, type=Path)
+    walkforward.add_argument("--out", required=True, type=Path)
+    walkforward.add_argument("--no-cache", action="store_true")
+    walkforward.add_argument("--offline-fixture", type=Path)
+    walkforward.add_argument("--n-trials", type=int)
     compare = subparsers.add_parser("compare")
     compare.add_argument("--runs", nargs="+", type=Path, required=True)
     compare.add_argument("--out", required=True, type=Path)
@@ -348,6 +360,104 @@ def main(argv: list[str] | None = None) -> int:
         )
         for key, value in simulation_result.metrics.items():
             print(f"{key}: {value}")
+        return 0
+    if args.command == "walkforward":
+        from datetime import date
+
+        from .basis import time_to_expiry_years, trailing_dividend_yield
+        from .ingest.yahoo import (
+            YahooError,
+            build_pair_bars,
+            fetch_yahoo_bars,
+            fetch_yahoo_dividends,
+            fetch_yahoo_rate,
+        )
+        from .walkforward import WalkForwardConfig, evaluate_trials, write_artifacts
+
+        sim_config, wf_config = load_walkforward_config(args.config)
+        if args.n_trials is not None:
+            wf_config = WalkForwardConfig(
+                n_trials=args.n_trials,
+                n_folds=wf_config.n_folds,
+                min_train_sessions=wf_config.min_train_sessions,
+                min_trades_per_fold=wf_config.min_trades_per_fold,
+                seed=wf_config.seed,
+                space=wf_config.space,
+            )
+        yahoo_config = load_yahoo_config(args.config)
+        start = date.fromisoformat(sim_config.start[:10])
+        end = date.fromisoformat(sim_config.end[:10])
+        wf_frames: dict[str, pd.DataFrame] = {}
+        if args.offline_fixture:
+            for product in sim_config.products:
+                candidate = args.offline_fixture / f"{product.lower()}.parquet"
+                if not candidate.exists():
+                    candidate = args.offline_fixture / f"{product}.parquet"
+                wf_frames[product] = pd.read_parquet(candidate)
+        else:
+            for product in sim_config.products:
+                wf_frames[product], _ = fetch_yahoo_bars(
+                    product,
+                    start,
+                    end,
+                    yahoo_config.interval,
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+        carry_values = None
+        if yahoo_config.carry_adjust:
+            try:
+                rate_values, _ = fetch_yahoo_rate(
+                    yahoo_config.rate_symbol,
+                    start,
+                    end,
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+                dividends, _ = fetch_yahoo_dividends(
+                    sim_config.products[1],
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+                rate_daily = rate_values.groupby(level=0).last().shift(1)
+                spot_daily = (
+                    wf_frames[sim_config.products[1]]
+                    .set_index("session_date")["close"]
+                    .groupby(level=0)
+                    .last()
+                )
+                div_yield = trailing_dividend_yield(dividends, spot_daily)
+                tau = pd.Series(
+                    [time_to_expiry_years(pd.Timestamp(item).date()) for item in spot_daily.index],
+                    index=spot_daily.index,
+                )
+                carry_values = (
+                    rate_daily.reindex(spot_daily.index).ffill().fillna(0.0) - div_yield
+                ) * tau
+            except (YahooError, OSError, ValueError):
+                if (
+                    yahoo_config.fallback_risk_free_rate is None
+                    or yahoo_config.fallback_dividend_yield is None
+                ):
+                    raise
+                session_index = wf_frames[sim_config.products[1]]["session_date"].drop_duplicates()
+                tau = pd.Series(
+                    [time_to_expiry_years(pd.Timestamp(item).date()) for item in session_index],
+                    index=session_index,
+                )
+                carry_values = (
+                    yahoo_config.fallback_risk_free_rate - yahoo_config.fallback_dividend_yield
+                ) * tau
+        pair_bars = build_pair_bars(
+            wf_frames[sim_config.products[0]],
+            wf_frames[sim_config.products[1]],
+            bar_minutes=yahoo_config.bar_minutes,
+            rth_only=yahoo_config.rth_only,
+            carry=carry_values,
+        )
+        result = evaluate_trials(sim_config, pair_bars, wf_config)
+        selection = write_artifacts(result, args.out)
+        print(json.dumps(selection, indent=2, sort_keys=True, default=str))
         return 0
     if args.command == "compare":
         table = _comparison_table(args.runs)

@@ -1,0 +1,59 @@
+[simulation]
+products = ["ES", "SPY"]
+start = "2026-07-20"
+end = "2026-09-14"
+initial_capital_usd = 1000000.0
+bar_minutes = 5
+rth_only = true
+signal_lag_bars = 1
+z_window = 78
+entry = 2.0
+exit = 0.5
+stop = 4.0
+hedge_lookback_sessions = 10
+min_hedge_sessions = 5
+mask_roll_sessions = false
+adjust = "none"
+z_reset_each_session = true
+carry_adjust = true
+hedge_method = "unit"
+kalman_delta = 1e-5
+kalman_obs_var = 1e-6
+coint_pvalue_gate = 0.10
+threshold_mode = "ou"
+half_life_min_bars = 1.0
+half_life_max_bars = 78.0
+max_holding_half_lives = 2.0
+ou_min_obs = 40
+
+[costs]
+equity_commission_per_share_usd = 0.005
+equity_slippage_ticks = 1.0
+equity_half_spread_ticks = 0.5
+
+[sizer]
+name = "vol_target"
+target_daily_vol_usd = 5000.0
+lookback_sessions = 10
+max_units_a = 50
+max_leg_notional_usd = 2000000.0
+
+[yahoo]
+rate_symbol = "IRX"
+carry_adjust = true
+fallback_risk_free_rate = 0.04
+fallback_dividend_yield = 0.012
+interval = "5m"
+bar_minutes = 5
+rth_only = true
+
+[walkforward]
+n_trials = 24
+n_folds = 3
+min_train_sessions = 15
+min_trades_per_fold = 3
+seed = 0
+
+[walkforward.space]
+half_life_min_bars = [2.0, 20.0]
+half_life_max_bars = [20.0, 200.0]

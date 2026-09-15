@@ -181,6 +181,41 @@ the ^IRX discount-yield approximation; dividends applied by ex-date; roughly
 modelling. Real-data diagnostics, baseline/Kalman/unit-hedge comparisons, and
 limitations: `docs/results/2026-09-15_index_vs_etf_basis_real_data.md`.
 
+## Walk-forward evaluation
+
+The walk-forward command evaluates sampled hyperparameters on anchored,
+contiguous test folds. Each trial is simulated once over the full causal input
+range; daily PnL is then sliced into folds. After the first test fold, a trial
+is eligible only when it has at least the configured minimum number of trades
+in every prior training fold. Selection maximizes
+`median(training Sharpe) - 0.5 * IQR(training Sharpe)`, with ties resolved by
+the lowest trial id. Fold-zero uses the base configuration. The final
+recommended model maximizes median OOS-fold Sharpe among models trading in at
+least half of the folds.
+
+Entry filters can require the expected OU (or fixed rolling-mean) deviation to
+cover a multiple of modelled round-trip costs with `min_edge_cost_multiple`.
+`ofi_threshold` is an optional causal entry filter using a
+**bar-derived order-flow-imbalance proxy**:
+`sign(close-open) * volume`, normalized by rolling volume. Yahoo bars contain
+no order-book data, so this is not true order-flow or order-book imbalance.
+Both filters affect entries only; exits and stops remain active.
+
+```bash
+ifsa walkforward --config configs/wf_es_spy_daily.toml \
+  --out data/results/walkforward/es_spy_daily
+ifsa walkforward --config configs/wf_nq_qqq_daily.toml \
+  --out data/results/walkforward/nq_qqq_daily
+ifsa walkforward --config configs/wf_es_spy_5m.toml \
+  --out data/results/walkforward/es_spy_5m
+ifsa walkforward --config configs/wf_nq_qqq_5m.toml \
+  --out data/results/walkforward/nq_qqq_5m
+```
+
+Each output directory contains deterministic CSV/JSON/Markdown summaries and
+small PNG diagnostics, including the stitched selected-per-fold OOS equity
+curve and the base-configuration benchmark.
+
 ## Project layout
 
 ```text

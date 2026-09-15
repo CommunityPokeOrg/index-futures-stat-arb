@@ -114,3 +114,19 @@ def load_yahoo_config(path: str | Path) -> YahooConfig:
     with Path(path).open("rb") as stream:
         values: dict[str, Any] = tomllib.load(stream).get("yahoo", {})
     return YahooConfig(**values)
+
+
+def load_walkforward_config(path: str | Path) -> tuple[Any, Any]:
+    """Load the simulation and walk-forward sections from a TOML config."""
+    from .walkforward import SearchSpace, WalkForwardConfig
+
+    simulation = load_simulation_config(path)
+    with Path(path).open("rb") as stream:
+        payload: dict[str, Any] = tomllib.load(stream)
+    values = dict(payload.get("walkforward", {}))
+    space_values = {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in values.pop("space", {}).items()
+    }
+    space = SearchSpace(**space_values)
+    return simulation, WalkForwardConfig(space=space, **values)

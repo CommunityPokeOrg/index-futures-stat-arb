@@ -78,6 +78,8 @@ def compute_metrics(
         )
         if {"notional_a", "notional_b"} <= set(positions.columns) and len(positions)
         else 0.0,
+        "edge_gated_fraction": 0.0,
+        "ofi_gated_fraction": 0.0,
     }
 
 

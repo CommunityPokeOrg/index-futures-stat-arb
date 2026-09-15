@@ -460,6 +460,8 @@ def build_pair_bars(
 
     def prepare(frame: pd.DataFrame, product: str) -> pd.DataFrame:
         out = frame.copy()
+        if "volume" not in out:
+            out["volume"] = 0
         out["roll_flag"] = False
         is_intraday = not out.empty and str(out["interval"].iloc[0]) != "1d"
         if is_intraday and bar_minutes is not None:

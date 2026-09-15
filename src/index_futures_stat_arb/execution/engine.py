@@ -27,6 +27,24 @@ class LookaheadError(RuntimeError):
     pass
 
 
+def bar_derived_ofi_proxy(
+    opens: Sequence[float],
+    closes: Sequence[float],
+    volumes: Sequence[float],
+    window: int,
+) -> float:
+    """Return a causal bar-derived OFI proxy, not true order-book imbalance."""
+    if window < 1:
+        raise ValueError("ofi window must be positive")
+    values = np.sign(np.asarray(closes, dtype=float) - np.asarray(opens, dtype=float))
+    volume_values = np.maximum(np.asarray(volumes, dtype=float), 0.0)
+    values = values * volume_values
+    values = values[-window:]
+    volume_values = volume_values[-window:]
+    total_volume = float(volume_values.sum())
+    return float(values.sum() / total_volume) if total_volume > 0 else 0.0
+
+
 @dataclass(frozen=True)
 class SimulationConfig:
     start: str
@@ -49,6 +67,9 @@ class SimulationConfig:
     kalman_delta: float = 1e-5
     kalman_obs_var: float = 1e-4
     coint_pvalue_gate: float | None = None
+    min_edge_cost_multiple: float | None = None
+    ofi_threshold: float | None = None
+    ofi_window: int = 20
     threshold_mode: Literal["fixed", "ou"] = "fixed"
     half_life_min_bars: float = 1.0
     half_life_max_bars: float | None = None
@@ -66,6 +87,8 @@ class SimulationConfig:
             raise ValueError(f"unsupported hedge method: {self.hedge_method!r}")
         if self.threshold_mode not in {"fixed", "ou"}:
             raise ValueError(f"unsupported threshold mode: {self.threshold_mode!r}")
+        if self.ofi_window < 1:
+            raise ValueError("ofi_window must be positive")
 
 
 @dataclass
@@ -202,6 +225,8 @@ def load_pair_bars(
         adjusted["roll_flag"] = adjusted["session_date"].isin(roll_sessions)
         adjusted = _resample(adjusted, cfg.bar_minutes, cfg.rth_only, product)
         unadjusted = _resample(unadjusted, cfg.bar_minutes, cfg.rth_only, product)
+        if "volume" not in adjusted:
+            adjusted["volume"] = 0
         adjusted["close_raw"] = unadjusted["close"].to_numpy()
         frames.append(adjusted)
     a, b = frames
@@ -352,6 +377,10 @@ def run_simulation(
     log_b_history: list[float] = []
     carry_history: list[float] = []
     session_history: list[date] = []
+    ofi_values: list[float] = []
+    ofi_volumes: list[float] = []
+    ofi_opens: list[float] = []
+    ofi_closes: list[float] = []
     sessions = bars["session_date"].drop_duplicates().tolist()
     unit_session_pnl = 0.0
     previous_session: date | None = None
@@ -608,21 +637,81 @@ def run_simulation(
                     "beta": beta,
                 }
             )
+        old_signal = signal_state.position
         gate_reasons: list[str] = []
         if not session_entry_gate:
             gate_reasons.append(session_gate_reason or "cointegration")
         if not threshold_gate:
             gate_reasons.append("half_life")
+        candidate_signal = 1 if z <= -cfg.entry else -1 if z >= cfg.entry else 0
+        edge_gate = True
+        ofi_gate = True
+        if old_signal == 0 and candidate_signal:
+            if cfg.min_edge_cost_multiple is not None:
+                center = (
+                    ou_mu
+                    if np.isfinite(ou_mu)
+                    else (float(np.mean(prior_window)) if len(prior_window) else spread)
+                )
+                target_a, target_b = sizer.size(
+                    candidate_signal,
+                    float(row["a_close"]),
+                    float(row["b_close"]),
+                    beta if np.isfinite(beta) else 1.0,
+                    state,
+                )
+                spec_a = PRODUCTS[cfg.products[0]]
+                spec_b = PRODUCTS[cfg.products[1]]
+                cost_usd = cfg.costs.fees_usd(spec_a, target_a) + cfg.costs.fees_usd(
+                    spec_b, target_b
+                )
+                for spec, price, target_units in (
+                    (spec_a, float(row["a_close"]), target_a),
+                    (spec_b, float(row["b_close"]), target_b),
+                ):
+                    side: Literal[1, -1] = 1 if target_units >= 0 else -1
+                    fill = cfg.costs.fill_price(spec, price, side)
+                    cost_usd += 2.0 * abs(fill - price) * abs(target_units) * spec.multiplier_usd
+                edge_usd = (
+                    abs(spread - center)
+                    * abs(target_a)
+                    * float(row["a_close"])
+                    * spec_a.multiplier_usd
+                )
+                edge_gate = edge_usd >= cfg.min_edge_cost_multiple * cost_usd
+                if not edge_gate:
+                    gate_reasons.append("edge")
+            if cfg.ofi_threshold is not None:
+                volume = float(row.get("a_volume", 0.0) or 0.0)
+                ofi = np.sign(float(row["a_close"]) - float(row["a_open"])) * volume
+                ofi_values.append(float(ofi))
+                ofi_volumes.append(volume)
+                ofi_opens.append(float(row["a_open"]))
+                ofi_closes.append(float(row["a_close"]))
+                ofi_norm = bar_derived_ofi_proxy(ofi_opens, ofi_closes, ofi_volumes, cfg.ofi_window)
+                ofi_gate = not (
+                    (candidate_signal > 0 and ofi_norm < -cfg.ofi_threshold)
+                    or (candidate_signal < 0 and ofi_norm > cfg.ofi_threshold)
+                )
+                if not ofi_gate:
+                    gate_reasons.append("ofi")
+        elif cfg.ofi_threshold is not None:
+            volume = float(row.get("a_volume", 0.0) or 0.0)
+            ofi_values.append(float(np.sign(float(row["a_close"]) - float(row["a_open"])) * volume))
+            ofi_volumes.append(volume)
+            ofi_opens.append(float(row["a_open"]))
+            ofi_closes.append(float(row["a_close"]))
         allow_entry = (
             session_entry_gate
             and threshold_gate
+            and edge_gate
+            and ofi_gate
             and not (
                 cfg.mask_roll_sessions and (bool(row.get("a_roll")) or bool(row.get("b_roll")))
             )
         )
         gated = not allow_entry
         gate_reason = ",".join(gate_reasons) if gate_reasons else None
-        old_signal = signal_state.position
         signal = (
             signal_override[i]
             if signal_override is not None and i < len(signal_override)
@@ -642,7 +731,7 @@ def run_simulation(
             signal_state.bars_held = 0
         if (np.isfinite(beta) or signal_override is not None) and signal != old_signal:
             sizing_beta = beta if np.isfinite(beta) else 1.0
-            target = sizer.size(
+            sizing_target = sizer.size(
                 signal,
                 float(row["a_close"]),
                 float(row["b_close"]),
@@ -650,7 +739,7 @@ def run_simulation(
                 state,
             )
             reason = signal_state.last_event or _signal_event(old_signal, signal) or "exit"
-            pending[i + cfg.signal_lag_bars] = (*target, reason)
+            pending[i + cfg.signal_lag_bars] = (*sizing_target, reason)
         signals.append(
             {
                 "ts_event": row["ts_event"],
@@ -708,6 +797,14 @@ def run_simulation(
     )
     metrics["half_life_gated_fraction"] = (
         float(reasons.str.contains("half_life").mean()) if len(reasons) else 0.0
+    )
+    metrics["edge_gated_fraction"] = (
+        float(reasons.str.contains(r"(?:^|,)edge(?:,|$)", regex=True).mean())
+        if len(reasons)
+        else 0.0
+    )
+    metrics["ofi_gated_fraction"] = (
+        float(reasons.str.contains("ofi").mean()) if len(reasons) else 0.0
     )
     return SimulationResult(
         position_frame,

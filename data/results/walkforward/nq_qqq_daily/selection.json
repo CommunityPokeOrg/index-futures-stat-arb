@@ -1,0 +1,82 @@
+{
+  "base_trial": 0,
+  "best_in_sample_oos_sharpe": 0.5711433576339088,
+  "best_in_sample_trial": 46,
+  "recommended_fold_sharpes": [
+    -0.4994360399878624,
+    0.9909954405051338,
+    0.9614689810411551,
+    1.5851472679726555,
+    0.2121797942720198
+  ],
+  "recommended_model": {
+    "fold_sharpes": [
+      -0.4994360399878624,
+      0.9909954405051338,
+      0.9614689810411551,
+      1.5851472679726555,
+      0.2121797942720198
+    ],
+    "params": {
+      "coint_pvalue_gate": 0.07910411823511898,
+      "entry": 1.78931959414192,
+      "exit_ratio": 0.4492534350023611,
+      "half_life_max_bars": 24.40088786330228,
+      "half_life_min_bars": 0.7070214397412368,
+      "kalman_delta": 3.7568084175778886e-05,
+      "kalman_obs_var": 7.998908708337386e-06,
+      "max_holding_half_lives": 2.559499223002695,
+      "min_edge_cost_multiple": 1.280163431190723,
+      "ofi_threshold": null,
+      "stop_ratio": 1.8484672129282964
+    },
+    "rank_stability": 3,
+    "trial_id": 33
+  },
+  "recommended_params": {
+    "coint_pvalue_gate": 0.07910411823511898,
+    "entry": 1.78931959414192,
+    "exit_ratio": 0.4492534350023611,
+    "half_life_max_bars": 24.40088786330228,
+    "half_life_min_bars": 0.7070214397412368,
+    "kalman_delta": 3.7568084175778886e-05,
+    "kalman_obs_var": 7.998908708337386e-06,
+    "max_holding_half_lives": 2.559499223002695,
+    "min_edge_cost_multiple": 1.280163431190723,
+    "ofi_threshold": null,
+    "stop_ratio": 1.8484672129282964
+  },
+  "recommended_rank_stability": 3,
+  "recommended_trial": 33,
+  "rule": "median(train Sharpe) - 0.5*IQR(train Sharpe), min trades per train fold; ties lowest trial id",
+  "selected_trials": [
+    {
+      "fold": 0,
+      "trial_id": 0
+    },
+    {
+      "fold": 1,
+      "trial_id": 46
+    },
+    {
+      "fold": 2,
+      "trial_id": 19
+    },
+    {
+      "fold": 3,
+      "trial_id": 33
+    },
+    {
+      "fold": 4,
+      "trial_id": 33
+    }
+  ],
+  "stitched_oos": {
+    "bars": 2438.0,
+    "fees_slippage": 3847.6202185058582,
+    "max_dd": 92884.01245117188,
+    "sharpe": 0.4559306164518576,
+    "turnover": 35.41741708611035,
+    "win_rate": 0.01394585726004922
+  }
+}

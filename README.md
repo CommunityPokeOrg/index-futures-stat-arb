@@ -178,7 +178,8 @@ Limitations include Yahoo ES=F being an unadjusted continuous front-month
 series; SPY daily closes at 16:00 ET versus the ES=F daily settlement label;
 the ^IRX discount-yield approximation; dividends applied by ex-date; roughly
 60-day 5-minute retention; no ETF borrow or financing cost; and no margin
-modelling.
+modelling. Real-data diagnostics, baseline/Kalman/unit-hedge comparisons, and
+limitations: `docs/results/2026-09-15_index_vs_etf_basis_real_data.md`.
 
 ## Project layout
 

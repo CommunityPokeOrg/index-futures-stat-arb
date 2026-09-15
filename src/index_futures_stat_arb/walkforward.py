@@ -395,6 +395,14 @@ def _stitched_metrics(result: WalkForwardResult) -> dict[str, float]:
     return _oos_metrics(result, [select(result, fold.index) for fold in result.folds])
 
 
+def _stitched_daily_pnl(result: WalkForwardResult) -> pd.Series:
+    pieces: list[pd.Series] = []
+    for fold in result.folds:
+        trial = result.simulations[select(result, fold.index)]
+        pieces.append(trial.daily_pnl.loc[_session_mask(trial.daily_pnl.index, fold.test_sessions)])
+    return pd.concat(pieces) if pieces else pd.Series(dtype=float)
+
+
 def _base_oos_metrics(result: WalkForwardResult) -> dict[str, float]:
     return _oos_metrics(result, [0 for _ in result.folds])
 
@@ -626,6 +634,10 @@ def write_artifacts(result: WalkForwardResult, out: Path) -> dict[str, Any]:
     }
     (out / "selection.json").write_text(
         json.dumps(selection, indent=2, sort_keys=True, default=str) + "\n"
+    )
+    stitched_daily = _stitched_daily_pnl(result)
+    stitched_daily.rename("pnl").rename_axis("session_date").to_csv(
+        out / "stitched_oos_daily_pnl.csv"
     )
     summary_text = "# Walk-forward evaluation\n\n"
     summary_text += "## Folds\n\n" + _markdown_table(_fold_summary_frame(result)) + "\n\n"

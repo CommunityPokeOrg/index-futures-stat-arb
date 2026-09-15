@@ -61,6 +61,33 @@ def main(argv: list[str] | None = None) -> int:
     walkforward.add_argument("--no-cache", action="store_true")
     walkforward.add_argument("--offline-fixture", type=Path)
     walkforward.add_argument("--n-trials", type=int)
+    montecarlo = subparsers.add_parser("montecarlo")
+    montecarlo_subparsers = montecarlo.add_subparsers(dest="montecarlo_mode", required=True)
+    bootstrap = montecarlo_subparsers.add_parser("bootstrap")
+    bootstrap.add_argument("run_dir", nargs="?", type=Path)
+    bootstrap.add_argument("--walkforward-dir", type=Path)
+    bootstrap.add_argument("--block-len", type=int)
+    bootstrap.add_argument("--n-paths", type=int, default=10_000)
+    bootstrap.add_argument("--regime-col")
+    bootstrap.add_argument("--regime-preserving", action="store_true")
+    bootstrap.add_argument("--config", type=Path)
+    bootstrap.add_argument("--seed", type=int, default=0)
+    bootstrap.add_argument("--workers", type=int, default=1)
+    bootstrap.add_argument("--chunk-size", type=int, default=1)
+    bootstrap.add_argument("--out", required=True, type=Path)
+    synthetic = montecarlo_subparsers.add_parser("synthetic")
+    synthetic.add_argument("--config", required=True, type=Path)
+    synthetic.add_argument("--kappa", type=float, required=True)
+    synthetic.add_argument("--sigma", type=float, required=True)
+    synthetic.add_argument("--n-paths", type=int, default=20)
+    synthetic.add_argument("--threshold", type=float, default=0.0)
+    synthetic.add_argument("--seed", type=int, default=0)
+    synthetic.add_argument("--workers", type=int, default=1)
+    synthetic.add_argument("--chunk-size", type=int, default=1)
+    synthetic.add_argument("--out", required=True, type=Path)
+    deflate = montecarlo_subparsers.add_parser("deflate")
+    deflate.add_argument("--walkforward-dir", required=True, type=Path)
+    deflate.add_argument("--out", required=True, type=Path)
     compare = subparsers.add_parser("compare")
     compare.add_argument("--runs", nargs="+", type=Path, required=True)
     compare.add_argument("--out", required=True, type=Path)
@@ -458,6 +485,86 @@ def main(argv: list[str] | None = None) -> int:
         result = evaluate_trials(sim_config, pair_bars, wf_config)
         selection = write_artifacts(result, args.out)
         print(json.dumps(selection, indent=2, sort_keys=True, default=str))
+        return 0
+    if args.command == "montecarlo":
+        from .montecarlo import (
+            _load_yahoo_pair_bars,
+            _read_daily_frame,
+            _regime_labels_from_bars,
+            load_daily_pnl,
+        )
+        from .montecarlo import (
+            bootstrap as run_bootstrap,
+        )
+        from .montecarlo import (
+            deflate as run_deflate,
+        )
+        from .montecarlo import (
+            synthetic as run_synthetic,
+        )
+        from .montecarlo import (
+            write_artifacts as write_montecarlo_artifacts,
+        )
+
+        if args.montecarlo_mode == "bootstrap":
+            if (args.run_dir is None) == (args.walkforward_dir is None):
+                parser.error("bootstrap requires exactly one run_dir or --walkforward-dir")
+            is_walkforward = args.walkforward_dir is not None
+            root = args.walkforward_dir or args.run_dir
+            pnl = load_daily_pnl(root, walkforward=is_walkforward)
+            labels = None
+            if args.regime_preserving:
+                if args.config is not None:
+                    _, regime_bars = _load_yahoo_pair_bars(args.config)
+                    labels_series = _regime_labels_from_bars(regime_bars)
+                    daily_frame = _read_daily_frame(root, walkforward=is_walkforward)
+                    session_dates = pd.to_datetime(daily_frame["session_date"]).dt.date
+                    label_map = {
+                        pd.Timestamp(cast(Any, index)).date(): int(value)
+                        for index, value in labels_series.items()
+                    }
+                    aligned = [label_map.get(session_date) for session_date in session_dates]
+                    if all(value is not None for value in aligned):
+                        labels = np.asarray(aligned, dtype=int)
+                elif args.run_dir is not None and args.regime_col:
+                    frame = pd.read_csv(args.run_dir / "daily.csv")
+                    if args.regime_col in frame:
+                        labels = frame[args.regime_col].to_numpy()
+                if labels is None or len(labels) != len(pnl):
+                    print(
+                        "regime-preserving requested but no aligned regime labels; "
+                        "using unstratified"
+                    )
+                    labels = None
+            mc_result = run_bootstrap(
+                pnl.to_numpy(),
+                n_paths=args.n_paths,
+                block_len=args.block_len,
+                seed=args.seed,
+                workers=args.workers,
+                chunk_size=args.chunk_size,
+                regime_labels=labels,
+            )
+        elif args.montecarlo_mode == "synthetic":
+            sim_config, bars = _load_yahoo_pair_bars(args.config)
+            mc_result = run_synthetic(
+                bars,
+                sim_config,
+                kappa=args.kappa,
+                sigma=args.sigma,
+                n_paths=args.n_paths,
+                seed=args.seed,
+                workers=args.workers,
+                chunk_size=args.chunk_size,
+                threshold=args.threshold,
+            )
+        else:
+            root = args.walkforward_dir
+            trials = pd.read_csv(root / "trials.csv")
+            pnl = load_daily_pnl(root, walkforward=True)
+            mc_result = run_deflate(trials, pnl.to_numpy())
+        write_montecarlo_artifacts(mc_result, args.out)
+        print(json.dumps(mc_result, indent=2, sort_keys=True))
         return 0
     if args.command == "compare":
         table = _comparison_table(args.runs)

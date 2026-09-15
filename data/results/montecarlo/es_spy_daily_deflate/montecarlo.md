@@ -1,0 +1,20 @@
+# Monte Carlo harness — SYNTHETIC / RESAMPLED — harness test, not evidence of edge
+
+```json
+{
+  "best_oos_sharpe": 0.9424429438,
+  "disclaimer": "SYNTHETIC / RESAMPLED \u2014 harness test, not evidence of edge",
+  "dsr": 0.9190947086465783,
+  "expected_max_sharpe_benchmark": 0.7422083844899146,
+  "minimum_track_record_sessions_95pct": null,
+  "mode": "deflate",
+  "n_trials": 48,
+  "psr_against_zero": 0.9999999999772103,
+  "stitched_oos_sharpe": -0.1613553375501917,
+  "stitched_pnl_kurtosis": 188.5245415230969,
+  "stitched_pnl_skew": -7.727128197263123,
+  "stitched_sessions": 2438,
+  "trial_sharpe_column": "median_oos_sharpe",
+  "trial_sharpe_variance": 0.10779478223815958
+}
+```

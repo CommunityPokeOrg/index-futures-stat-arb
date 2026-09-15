@@ -219,6 +219,39 @@ curve and the base-configuration benchmark.
 Real-data walk-forward results, selection rule, and limitations:
 `docs/results/2026-09-15_walkforward_evaluation.md`.
 
+## Monte Carlo harness
+
+The `ifsa montecarlo` commands are deterministic **harness / power / stress
+tests, never evidence of real edge**. They resample observed daily PnL,
+exercise the existing engine on synthetic OU or random-walk basis paths, or
+calculate multiple-testing-adjusted Sharpe statistics. Outputs are written as
+`montecarlo.json`, `montecarlo.md`, and a compact `sharpe_distribution.png`.
+
+```bash
+ifsa montecarlo bootstrap \
+  --walkforward-dir data/results/walkforward/nq_qqq_daily \
+  --n-paths 10000 \
+  --out data/results/montecarlo/nq_qqq_daily_bootstrap
+
+ifsa montecarlo synthetic \
+  --config configs/sim_yahoo_nq_qqq_daily_refined.toml \
+  --kappa 0 \
+  --sigma 0.00239 \
+  --n-paths 20 \
+  --workers 4 \
+  --out data/results/montecarlo/nq_qqq_null
+
+ifsa montecarlo deflate \
+  --walkforward-dir data/results/walkforward/nq_qqq_daily \
+  --out data/results/montecarlo/nq_qqq_daily_deflate
+```
+
+Circular block bootstrap paths preserve local dependence; the default block
+length is `ceil(n**(1/3))`. Synthetic paths use jointly resampled real
+leg-B returns and volumes. A zero-kappa synthetic path is a random-walk null,
+while positive kappa is a power harness. Neither mode establishes
+profitability or a tradable edge.
+
 ## Project layout
 
 ```text

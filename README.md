@@ -219,6 +219,36 @@ curve and the base-configuration benchmark.
 Real-data walk-forward results, selection rule, and limitations:
 `docs/results/2026-09-15_walkforward_evaluation.md`.
 
+## Results dashboard (GitHub Pages)
+
+`dashboard/` is a static Vite + React showcase of the committed walk-forward artefacts
+(stitched OOS metrics, per-fold selection, trial tables, plots, and explicit small-sample /
+5-minute / no-edge warnings). It reads `data/results/walkforward/**` at build time — nothing
+is recomputed in the browser.
+
+```bash
+cd dashboard
+npm ci
+npm run dev       # local dev server
+npm run build     # -> dashboard/dist (relative base, works at any Pages subpath)
+npm run preview   # serve the built site
+npm test          # build + dist validation (relative assets, plots, exact metrics embedded)
+```
+
+`.github/workflows/pages.yml` builds and validates on pull requests and deploys to GitHub
+Pages from the default branch (`actions/upload-pages-artifact` + `actions/deploy-pages`).
+Enable once under **Settings → Pages → Source: GitHub Actions**; the site is then served at
+`https://<org>.github.io/index-futures-stat-arb/`. See `dashboard/README.md`.
+
+## Research plan
+
+`docs/research/next_steps_validation_protocol.md` records the current honest conclusion
+(ES/SPY OOS Sharpe −0.16; NQ/QQQ 0.46, t ≈ 1.4; 5m uninformative), falsifiable hypotheses,
+and the validation protocol (untouched holdout, nested walk-forward, embargo, deflated
+Sharpe, parameter stability, cost/capacity stress, regime analysis, institutional-data
+replication) that any future claim of edge must pass. Monte Carlo findings and feasibility:
+`docs/results/2026-09-15_montecarlo_evaluation.md`.
+
 ## Monte Carlo harness
 
 The `ifsa montecarlo` commands are deterministic **harness / power / stress

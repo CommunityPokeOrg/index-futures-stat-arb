@@ -32,8 +32,12 @@ def fetch_yfinance(
         ) from exc
 
     raw = yf.download(
-        list(tickers.values()), start=start, end=end, interval=interval,
-        auto_adjust=False, progress=False,
+        list(tickers.values()),
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
     )
     if raw.empty:
         return pd.DataFrame(columns=list(tickers.keys()))
@@ -67,9 +71,7 @@ def fetch_databento(
     """
     api_key = api_key or os.environ.get("DATABENTO_API_KEY")
     if not api_key:
-        raise RuntimeError(
-            "DATABENTO_API_KEY is not set; add it to .env or pass api_key="
-        )
+        raise RuntimeError("DATABENTO_API_KEY is not set; add it to .env or pass api_key=")
     dataset = dataset or os.environ.get("DATABENTO_DATASET") or "GLBX.MDP3"
     try:
         import databento as db
@@ -92,9 +94,7 @@ def fetch_databento(
     except Exception as exc:
         raise RuntimeError(f"Databento request failed: {exc}") from exc
 
-    prices = df.reset_index().pivot_table(
-        index="ts_event", columns="symbol", values="close"
-    )
+    prices = df.reset_index().pivot_table(index="ts_event", columns="symbol", values="close")
     inverse = {v: k for k, v in symbols.items()}
     prices = prices.rename(columns=inverse).reindex(columns=list(symbols.keys()))
     prices.index = pd.to_datetime(prices.index).tz_localize(None)
@@ -157,9 +157,7 @@ def generate_synthetic_pair(
         spread[t] = spread[t - 1] * (1 - theta) + eps[t]
     log_es = alpha + beta * log_nq + spread
     index = pd.bdate_range("2018-01-01", periods=n)
-    return pd.DataFrame(
-        {"ES": np.exp(log_es), "NQ": np.exp(log_nq)}, index=index
-    )
+    return pd.DataFrame({"ES": np.exp(log_es), "NQ": np.exp(log_nq)}, index=index)
 
 
 def align_and_clean(
@@ -180,4 +178,4 @@ def align_and_clean(
 
 def log_prices(df: pd.DataFrame) -> pd.DataFrame:
     """Natural log of prices."""
-    return np.log(df)
+    return df.apply(np.log)

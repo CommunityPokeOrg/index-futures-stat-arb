@@ -1,0 +1,914 @@
+"""Incremental, no-lookahead two-leg pair simulation engine."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Any, Literal, cast
+
+import numpy as np
+import pandas as pd
+
+from ..cointegration import adf_test
+from ..continuous import Adjust, build_continuous
+from ..contracts import PRODUCTS, list_contracts
+from ..ingest.databento import read_partitioned
+from ..ou import fit_ou
+from ..rolls import RollConfig, build_roll_calendar, daily_from_bars, joint_roll_calendar
+from .costs import CostModel
+from .hedge import HedgeMethod, KalmanHedge, KalmanLevel, rolling_engle_granger
+from .metrics import compute_metrics
+from .sizing import Sizer, SizerSpec, SizerState, build_sizer
+
+
+class LookaheadError(RuntimeError):
+    pass
+
+
+def bar_derived_ofi_proxy(
+    opens: Sequence[float],
+    closes: Sequence[float],
+    volumes: Sequence[float],
+    window: int,
+) -> float:
+    """Return a causal bar-derived OFI proxy, not true order-book imbalance."""
+    if window < 1:
+        raise ValueError("ofi window must be positive")
+    values = np.sign(np.asarray(closes, dtype=float) - np.asarray(opens, dtype=float))
+    volume_values = np.maximum(np.asarray(volumes, dtype=float), 0.0)
+    values = values * volume_values
+    values = values[-window:]
+    volume_values = volume_values[-window:]
+    total_volume = float(volume_values.sum())
+    return float(values.sum() / total_volume) if total_volume > 0 else 0.0
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    start: str
+    end: str
+    products: tuple[str, str] = ("ES", "NQ")
+    bar_minutes: int = 5
+    rth_only: bool = True
+    signal_lag_bars: int = 1
+    z_window: int = 78
+    entry: float = 2.0
+    exit: float = 0.5
+    stop: float | None = 4.0
+    hedge_lookback_sessions: int = 10
+    min_hedge_sessions: int = 5
+    mask_roll_sessions: bool = True
+    z_reset_each_session: bool = True
+    carry_adjust: bool = False
+    recompute_z_window_on_refit: bool = True
+    hedge_method: HedgeMethod = "ols"
+    kalman_delta: float = 1e-5
+    kalman_obs_var: float = 1e-4
+    coint_pvalue_gate: float | None = None
+    min_edge_cost_multiple: float | None = None
+    ofi_threshold: float | None = None
+    ofi_window: int = 20
+    threshold_mode: Literal["fixed", "ou"] = "fixed"
+    half_life_min_bars: float = 1.0
+    half_life_max_bars: float | None = None
+    max_holding_half_lives: float | None = None
+    ou_min_obs: int = 30
+    adjust: Adjust = "panama"
+    roll: RollConfig = field(default_factory=RollConfig)
+    initial_capital_usd: float = 1_000_000.0
+    seed: int = 0
+    costs: CostModel = field(default_factory=CostModel)
+    sizer: SizerSpec = field(default_factory=SizerSpec)
+
+    def __post_init__(self) -> None:
+        if self.hedge_method not in {"ols", "kalman", "rolling_eg", "unit"}:
+            raise ValueError(f"unsupported hedge method: {self.hedge_method!r}")
+        if self.threshold_mode not in {"fixed", "ou"}:
+            raise ValueError(f"unsupported threshold mode: {self.threshold_mode!r}")
+        if self.ofi_window < 1:
+            raise ValueError("ofi_window must be positive")
+
+
+@dataclass
+class SimulationResult:
+    positions: pd.DataFrame
+    pnl: pd.Series
+    equity: pd.Series
+    trades: pd.DataFrame
+    daily_pnl: pd.Series
+    metrics: dict[str, float | int]
+    config: SimulationConfig
+    hedge_history: pd.DataFrame
+    signals: pd.DataFrame
+
+
+@dataclass
+class SignalState:
+    entry: float
+    exit: float
+    stop: float | None
+    position: int = 0
+    stopped: bool = False
+    last_event: str | None = None
+    max_holding_bars: float | None = None
+    bars_held: int = 0
+
+    def update(self, value: float, allow_entry: bool = True) -> int:
+        previous = self.position
+        self.last_event = None
+        if self.position:
+            self.bars_held += 1
+            if self.max_holding_bars is not None and self.bars_held > self.max_holding_bars:
+                self.position = 0
+                self.last_event = "time_stop"
+                self.stopped = True
+                self.max_holding_bars = None
+                self.bars_held = 0
+                return 0
+        if np.isnan(value):
+            return self.position
+        absolute = abs(value)
+        if self.stopped:
+            if absolute < self.exit:
+                self.stopped = False
+            else:
+                self.position = 0
+                return 0
+        if self.stop is not None and absolute > self.stop:
+            self.position = 0
+            self.stopped = True
+            if previous:
+                self.last_event = "stop"
+        elif self.position == 0 and allow_entry:
+            if value > self.entry:
+                self.position = -1
+                self.bars_held = 0
+            elif value < -self.entry:
+                self.position = 1
+                self.bars_held = 0
+        elif self.position and absolute < self.exit:
+            self.position = 0
+            self.max_holding_bars = None
+            self.bars_held = 0
+        if self.last_event is None and self.position != previous:
+            self.last_event = _signal_event(previous, self.position)
+        return self.position
+
+
+def _signal_event(old_signal: int, new_signal: int) -> str | None:
+    if old_signal == new_signal:
+        return None
+    if old_signal == 0:
+        return "entry"
+    if new_signal == 0:
+        return "exit"
+    return "flip"
+
+
+class _BarCursor:
+    def __init__(self, bars: pd.DataFrame, index: int = 0) -> None:
+        self._bars = bars
+        self.index = index
+
+    def at(self, index: int) -> pd.Series:
+        if index > self.index:
+            raise LookaheadError(f"requested bar {index} beyond cursor {self.index}")
+        return self._bars.iloc[index]
+
+
+def load_pair_bars(
+    cfg: SimulationConfig,
+    data_root: str | Path,
+    source: str,
+    dataset: str,
+    schema: str,
+) -> pd.DataFrame:
+    raw = read_partitioned(
+        data_root,
+        source,
+        dataset,
+        schema,
+        products=list(cfg.products),
+        start=date.fromisoformat(cfg.start[:10]),
+        end=date.fromisoformat(cfg.end[:10]),
+    )
+    start = date.fromisoformat(cfg.start[:10])
+    end = date.fromisoformat(cfg.end[:10])
+    calendars: dict[str, pd.DataFrame] = {}
+    contracts_by_product = {}
+    daily = daily_from_bars(raw)
+    for product in cfg.products:
+        contracts = list_contracts(product, start, end)
+        contracts_by_product[product] = contracts
+        calendars[product] = build_roll_calendar(product, daily, contracts, cfg.roll, start, end)
+    joint = joint_roll_calendar(calendars[cfg.products[0]], calendars[cfg.products[1]])
+    frames = []
+    for product in cfg.products:
+        calendars[product] = joint[product]
+        adjusted = build_continuous(
+            raw[raw["product"] == product],
+            calendars[product],
+            contracts_by_product[product],
+            cfg.adjust,
+            direction="forward",
+        )
+        unadjusted = build_continuous(
+            raw[raw["product"] == product],
+            calendars[product],
+            contracts_by_product[product],
+            "none",
+            direction="forward",
+        )
+        roll_sessions = set(calendars[product].loc[:, "roll_session_date"].dropna().tolist())
+        adjusted["roll_flag"] = adjusted["session_date"].isin(roll_sessions)
+        adjusted = _resample(adjusted, cfg.bar_minutes, cfg.rth_only, product)
+        unadjusted = _resample(unadjusted, cfg.bar_minutes, cfg.rth_only, product)
+        if "volume" not in adjusted:
+            adjusted["volume"] = 0
+        adjusted["close_raw"] = unadjusted["close"].to_numpy()
+        frames.append(adjusted)
+    a, b = frames
+    result = a.merge(b, on="ts_event", suffixes=("_a", "_b"))
+    result["session_date"] = result["session_date_a"]
+    result = result.rename(
+        columns={
+            "open_a": "a_open",
+            "high_a": "a_high",
+            "low_a": "a_low",
+            "close_a": "a_close",
+            "volume_a": "a_volume",
+            "contract_a": "a_contract",
+            "roll_flag_a": "a_roll",
+            "close_raw_a": "a_close_raw",
+            "open_b": "b_open",
+            "high_b": "b_high",
+            "low_b": "b_low",
+            "close_b": "b_close",
+            "volume_b": "b_volume",
+            "contract_b": "b_contract",
+            "roll_flag_b": "b_roll",
+            "close_raw_b": "b_close_raw",
+        }
+    )
+    return (
+        result[
+            [
+                "ts_event",
+                "session_date",
+                "a_open",
+                "a_high",
+                "a_low",
+                "a_close",
+                "a_volume",
+                "b_open",
+                "b_high",
+                "b_low",
+                "b_close",
+                "b_volume",
+                "a_contract",
+                "b_contract",
+                "a_roll",
+                "b_roll",
+                "a_close_raw",
+                "b_close_raw",
+            ]
+        ]
+        .sort_values("ts_event")
+        .reset_index(drop=True)
+    )
+
+
+def _resample(frame: pd.DataFrame, minutes: int, rth_only: bool, product: str = "") -> pd.DataFrame:
+    del product
+    frame = frame.copy()
+    if "roll_flag" not in frame:
+        frame["roll_flag"] = False
+    if rth_only:
+        frame = frame[frame["is_rth"]]
+    frame["_bar"] = frame["ts_event"].dt.floor(f"{minutes}min")
+    grouped = frame.sort_values("ts_event").groupby("_bar", sort=True)
+    result = grouped.agg(
+        session_date=("session_date", "first"),
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        contract=("contract", "last"),
+        roll_flag=("roll_flag", "any"),
+        is_rth=("is_rth", "any"),
+    ).reset_index(names="_bar")
+    result["ts_event"] = result["_bar"]
+    result = result.drop(columns="_bar")
+    return result
+
+
+def run_simulation(
+    bars: pd.DataFrame,
+    cfg: SimulationConfig,
+    signal_override: Sequence[int] | None = None,
+) -> SimulationResult:
+    """Run a bar-by-bar simulation with delayed execution.
+
+    A signal decided at bar ``i`` close is filled at bar ``i + lag`` open and
+    marked to that bar's close. Forward-Panama-adjusted prices keep USD PnL
+    continuous across rolls; roll close/reopen trades occur at the first bar
+    of the roll session at that bar's open.
+    """
+    bars = bars.sort_values("ts_event").reset_index(drop=True)
+    if "a_close" not in bars.columns and "es_close" in bars.columns:
+        bars = bars.rename(
+            columns={
+                "es_open": "a_open",
+                "es_high": "a_high",
+                "es_low": "a_low",
+                "es_close": "a_close",
+                "es_volume": "a_volume",
+                "nq_open": "b_open",
+                "nq_high": "b_high",
+                "nq_low": "b_low",
+                "nq_close": "b_close",
+                "nq_volume": "b_volume",
+                "es_contract": "a_contract",
+                "nq_contract": "b_contract",
+                "es_roll": "a_roll",
+                "nq_roll": "b_roll",
+                "es_close_raw": "a_close_raw",
+                "nq_close_raw": "b_close_raw",
+            }
+        )
+    if "carry" not in bars.columns:
+        bars["carry"] = 0.0
+    if bars.empty:
+        empty = pd.Series(dtype=float)
+        return SimulationResult(
+            pd.DataFrame(),
+            empty,
+            empty,
+            pd.DataFrame(),
+            empty,
+            {},
+            cfg,
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+    cursor = _BarCursor(bars)
+    spec_a = PRODUCTS[cfg.products[0]]
+    spec_b = PRODUCTS[cfg.products[1]]
+    sizer: Sizer = build_sizer(cfg.sizer, spec_a, spec_b)
+    state = SizerState()
+    signal_state = SignalState(cfg.entry, cfg.exit, cfg.stop)
+    positions: list[dict[str, object]] = []
+    pnl_values: list[float] = []
+    signals: list[dict[str, object]] = []
+    trades: list[dict[str, object]] = []
+    hedge_rows: list[dict[str, object]] = []
+    pending: dict[int, tuple[int, int, str]] = {}
+    held_a = held_b = 0
+    previous_a = previous_b = 0.0
+    previous_beta = float("nan")
+    alpha = beta = float("nan")
+    kalman: KalmanHedge | None = None
+    level: KalmanLevel | None = None
+    session_spreads: list[float] = []
+    log_a_history: list[float] = []
+    log_b_history: list[float] = []
+    carry_history: list[float] = []
+    session_history: list[date] = []
+    ofi_values: list[float] = []
+    ofi_volumes: list[float] = []
+    ofi_opens: list[float] = []
+    ofi_closes: list[float] = []
+    sessions = bars["session_date"].drop_duplicates().tolist()
+    unit_session_pnl = 0.0
+    previous_session: date | None = None
+    session_entry_gate = True
+    session_gate_reason: str | None = None
+
+    def state_window(state_alpha: float, state_beta: float, current_session: date) -> np.ndarray:
+        if cfg.z_reset_each_session:
+            indices = [
+                index
+                for index, history_session in enumerate(session_history)
+                if history_session == current_session
+            ]
+        else:
+            indices = list(range(len(log_a_history)))
+        if not indices:
+            return np.empty(0, dtype=float)
+        a_values = np.asarray([log_a_history[index] for index in indices], dtype=float)
+        b_values = np.asarray([log_b_history[index] for index in indices], dtype=float)
+        carry_values = np.asarray([carry_history[index] for index in indices], dtype=float)
+        residuals = a_values - carry_values - state_alpha - state_beta * b_values
+        return residuals[-cfg.z_window :]
+
+    def sample_z(window: np.ndarray, current_spread: float) -> float:
+        values = np.asarray([*window, current_spread], dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) < 2 or not np.isfinite(current_spread):
+            return float("nan")
+        standard_deviation = float(np.std(values, ddof=1))
+        if standard_deviation <= 0 or not np.isfinite(standard_deviation):
+            return float("nan")
+        return float((current_spread - np.mean(values)) / standard_deviation)
+
+    for i in range(len(bars)):
+        cursor.index = i
+        row = cursor.at(i)
+        session = row["session_date"]
+        new_session = i == 0 or session != bars.iloc[i - 1]["session_date"]
+        if new_session:
+            if previous_session is not None:
+                state.unit_pnl_daily.loc[str(previous_session)] = unit_session_pnl
+            unit_session_pnl = 0.0
+            prior_sessions = [item for item in sessions if item < session][
+                -cfg.hedge_lookback_sessions :
+            ]
+            history = bars[bars["session_date"].isin(prior_sessions)]
+            session_gate_reason = None
+            if len(prior_sessions) >= cfg.min_hedge_sessions and len(history) >= 2:
+                x = np.log(history["b_close"].to_numpy())
+                y = np.log(history["a_close"].to_numpy())
+                if cfg.carry_adjust and "carry" in history:
+                    y = y - history["carry"].to_numpy()
+                if cfg.hedge_method == "unit":
+                    beta = 1.0
+                    alpha = float(np.mean(y - x))
+                    pvalue = float("nan")
+                    if cfg.coint_pvalue_gate is not None:
+                        try:
+                            pvalue = adf_test(pd.Series(y - x))["pvalue"]
+                        except Exception:
+                            pvalue = float("nan")
+                elif cfg.hedge_method == "rolling_eg":
+                    fit = rolling_engle_granger(y, x)
+                    alpha, beta, pvalue = fit.alpha, fit.beta, fit.pvalue
+                else:
+                    beta, alpha = np.polyfit(x, y, 1)
+                    pvalue = float("nan")
+                    if cfg.coint_pvalue_gate is not None:
+                        pvalue = rolling_engle_granger(y, x).pvalue
+                if cfg.hedge_method == "kalman":
+                    if kalman is None and np.isfinite(alpha + beta):
+                        kalman = KalmanHedge(
+                            delta=cfg.kalman_delta,
+                            obs_var=cfg.kalman_obs_var,
+                            beta=float(beta),
+                            alpha=float(alpha),
+                        )
+                    if kalman is not None:
+                        alpha, beta = kalman.alpha, kalman.beta
+                    if cfg.coint_pvalue_gate is not None:
+                        try:
+                            gate_window = state_window(alpha, beta, session)
+                            pvalue = adf_test(pd.Series(gate_window))["pvalue"]
+                        except Exception:
+                            pvalue = float("nan")
+                if cfg.hedge_method == "unit":
+                    if level is None and np.isfinite(alpha):
+                        level = KalmanLevel(
+                            delta=cfg.kalman_delta,
+                            obs_var=cfg.kalman_obs_var,
+                            alpha=float(alpha),
+                        )
+                    if level is not None:
+                        alpha, beta = level.alpha, 1.0
+                if cfg.coint_pvalue_gate is not None and (
+                    not np.isfinite(pvalue) or pvalue >= cfg.coint_pvalue_gate
+                ):
+                    session_entry_gate = False
+                    session_gate_reason = "cointegration"
+                else:
+                    session_entry_gate = True
+                if cfg.hedge_method not in {"kalman", "unit"}:
+                    hedge_rows.append(
+                        {
+                            "session_date": session,
+                            "alpha": alpha,
+                            "beta": beta,
+                            "pvalue": pvalue,
+                        }
+                    )
+                if (
+                    cfg.hedge_method not in {"kalman", "unit"}
+                    and not cfg.z_reset_each_session
+                    and cfg.recompute_z_window_on_refit
+                ):
+                    prior_spreads = y - alpha - beta * x
+                    session_spreads = list(prior_spreads[-cfg.z_window :])
+                elif cfg.z_reset_each_session:
+                    session_spreads = []
+            else:
+                alpha = beta = float("nan")
+                session_entry_gate = False
+                session_gate_reason = "hedge_history"
+                if cfg.z_reset_each_session:
+                    session_spreads = []
+            if cfg.hedge_method == "kalman" and kalman is not None:
+                alpha, beta = kalman.alpha, kalman.beta
+            elif cfg.hedge_method == "unit" and level is not None:
+                alpha, beta = level.alpha, 1.0
+        trade_start = len(trades)
+        if i in pending:
+            target_a, target_b, reason = pending.pop(i)
+            held_a, held_b = _execute_target(
+                row, held_a, held_b, target_a, target_b, reason, cfg, trades
+            )
+        if bool(row.get("a_roll", False)) or bool(row.get("b_roll", False)):
+            if i == 0 or session != bars.iloc[i - 1]["session_date"]:
+                previous_row = None if i == 0 else bars.iloc[i - 1]
+                if held_a and (
+                    previous_row is None or row["a_contract"] != previous_row["a_contract"]
+                ):
+                    _record_roll(row, previous_row, cfg.products[0], held_a, cfg, trades)
+                if held_b and (
+                    previous_row is None or row["b_contract"] != previous_row["b_contract"]
+                ):
+                    _record_roll(row, previous_row, cfg.products[1], held_b, cfg, trades)
+        current_pnl = _mark_pnl(
+            row,
+            i,
+            held_a,
+            held_b,
+            previous_a,
+            previous_b,
+            trades[trade_start:],
+            spec_a,
+            spec_b,
+            cfg.products,
+        )
+        current_pnl -= sum(
+            float(cast(Any, trade.get("fees_usd", 0.0))) for trade in trades[trade_start:]
+        )
+        pnl_values.append(current_pnl)
+        if i > 0:
+            hedge_unit = (
+                previous_beta
+                * previous_a
+                * spec_a.multiplier_usd
+                / (previous_b * spec_b.multiplier_usd)
+                if np.isfinite(previous_beta) and previous_b
+                else 1.0
+            )
+            unit_session_pnl += (
+                float(row["a_close"]) - previous_a
+            ) * spec_a.multiplier_usd - hedge_unit * (
+                float(row["b_close"]) - previous_b
+            ) * spec_b.multiplier_usd
+        previous_session = session
+        previous_a, previous_b = float(row["a_close"]), float(row["b_close"])
+        carry_value = float(row.get("carry", 0.0)) if cfg.carry_adjust else 0.0
+        log_a_raw = float(np.log(row["a_close"]))
+        log_a = log_a_raw - carry_value
+        log_b = float(np.log(row["b_close"]))
+        if kalman is not None:
+            prior_alpha, prior_beta = kalman.alpha, kalman.beta
+            kalman.predict(log_b)
+            spread = log_a - prior_alpha - prior_beta * log_b
+            prior_window = state_window(prior_alpha, prior_beta, session)
+        elif level is not None:
+            prior_alpha = level.alpha
+            level.predict()
+            spread = log_a - log_b - prior_alpha
+            prior_window = state_window(prior_alpha, 1.0, session)
+        else:
+            spread = (
+                float(log_a - alpha - beta * log_b) if np.isfinite(alpha + beta) else float("nan")
+            )
+            prior_window = np.asarray(session_spreads[-(cfg.z_window - 1) :], dtype=float)
+        half_life = float("nan")
+        ou_mu = float("nan")
+        ou_sigma = float("nan")
+        threshold_gate = True
+        if cfg.threshold_mode == "ou":
+            if len(prior_window) >= cfg.ou_min_obs:
+                try:
+                    params = fit_ou(prior_window, dt=1.0)
+                    half_life = params.half_life
+                    ou_mu = params.mu
+                    ou_sigma = params.stationary_std
+                    threshold_gate = (
+                        np.isfinite(half_life)
+                        and half_life >= cfg.half_life_min_bars
+                        and (cfg.half_life_max_bars is None or half_life <= cfg.half_life_max_bars)
+                        and np.isfinite(ou_mu)
+                        and np.isfinite(ou_sigma)
+                        and ou_sigma > 0
+                    )
+                    z = (
+                        float((spread - ou_mu) / ou_sigma)
+                        if np.isfinite(ou_mu) and np.isfinite(ou_sigma) and ou_sigma > 0
+                        else sample_z(prior_window, spread)
+                    )
+                except (ValueError, FloatingPointError):
+                    threshold_gate = False
+                    z = sample_z(prior_window, spread)
+            else:
+                threshold_gate = False
+                z = sample_z(prior_window, spread)
+        else:
+            z = sample_z(prior_window, spread)
+        session_spreads.append(spread)
+        log_a_history.append(log_a_raw)
+        log_b_history.append(log_b)
+        carry_history.append(carry_value)
+        session_history.append(session)
+        if kalman is not None:
+            kalman.update(log_a, log_b)
+            alpha, beta = kalman.alpha, kalman.beta
+            hedge_rows.append(
+                {
+                    "session_date": session,
+                    "ts_event": row["ts_event"],
+                    "alpha": alpha,
+                    "beta": beta,
+                }
+            )
+        elif level is not None:
+            level.update(log_a - log_b)
+            alpha, beta = level.alpha, 1.0
+            hedge_rows.append(
+                {
+                    "session_date": session,
+                    "ts_event": row["ts_event"],
+                    "alpha": alpha,
+                    "beta": beta,
+                }
+            )
+        old_signal = signal_state.position
+        gate_reasons: list[str] = []
+        if not session_entry_gate:
+            gate_reasons.append(session_gate_reason or "cointegration")
+        if not threshold_gate:
+            gate_reasons.append("half_life")
+        candidate_signal = 1 if z <= -cfg.entry else -1 if z >= cfg.entry else 0
+        edge_gate = True
+        ofi_gate = True
+        if old_signal == 0 and candidate_signal:
+            if cfg.min_edge_cost_multiple is not None:
+                center = (
+                    ou_mu
+                    if np.isfinite(ou_mu)
+                    else (float(np.mean(prior_window)) if len(prior_window) else spread)
+                )
+                target_a, target_b = sizer.size(
+                    candidate_signal,
+                    float(row["a_close"]),
+                    float(row["b_close"]),
+                    beta if np.isfinite(beta) else 1.0,
+                    state,
+                )
+                spec_a = PRODUCTS[cfg.products[0]]
+                spec_b = PRODUCTS[cfg.products[1]]
+                cost_usd = cfg.costs.fees_usd(spec_a, target_a) + cfg.costs.fees_usd(
+                    spec_b, target_b
+                )
+                for spec, price, target_units in (
+                    (spec_a, float(row["a_close"]), target_a),
+                    (spec_b, float(row["b_close"]), target_b),
+                ):
+                    side: Literal[1, -1] = 1 if target_units >= 0 else -1
+                    fill = cfg.costs.fill_price(spec, price, side)
+                    cost_usd += 2.0 * abs(fill - price) * abs(target_units) * spec.multiplier_usd
+                edge_usd = (
+                    abs(spread - center)
+                    * abs(target_a)
+                    * float(row["a_close"])
+                    * spec_a.multiplier_usd
+                )
+                edge_gate = edge_usd >= cfg.min_edge_cost_multiple * cost_usd
+                if not edge_gate:
+                    gate_reasons.append("edge")
+            if cfg.ofi_threshold is not None:
+                volume = float(row.get("a_volume", 0.0) or 0.0)
+                ofi = np.sign(float(row["a_close"]) - float(row["a_open"])) * volume
+                ofi_values.append(float(ofi))
+                ofi_volumes.append(volume)
+                ofi_opens.append(float(row["a_open"]))
+                ofi_closes.append(float(row["a_close"]))
+                ofi_norm = bar_derived_ofi_proxy(ofi_opens, ofi_closes, ofi_volumes, cfg.ofi_window)
+                ofi_gate = not (
+                    (candidate_signal > 0 and ofi_norm < -cfg.ofi_threshold)
+                    or (candidate_signal < 0 and ofi_norm > cfg.ofi_threshold)
+                )
+                if not ofi_gate:
+                    gate_reasons.append("ofi")
+        elif cfg.ofi_threshold is not None:
+            volume = float(row.get("a_volume", 0.0) or 0.0)
+            ofi_values.append(float(np.sign(float(row["a_close"]) - float(row["a_open"])) * volume))
+            ofi_volumes.append(volume)
+            ofi_opens.append(float(row["a_open"]))
+            ofi_closes.append(float(row["a_close"]))
+        allow_entry = (
+            session_entry_gate
+            and threshold_gate
+            and edge_gate
+            and ofi_gate
+            and not (
+                cfg.mask_roll_sessions and (bool(row.get("a_roll")) or bool(row.get("b_roll")))
+            )
+        )
+        gated = not allow_entry
+        gate_reason = ",".join(gate_reasons) if gate_reasons else None
+        signal = (
+            signal_override[i]
+            if signal_override is not None and i < len(signal_override)
+            else signal_state.update(z, allow_entry)
+        )
+        if signal_override is not None:
+            signal_state.last_event = _signal_event(old_signal, signal)
+            signal_state.position = signal
+        if (
+            signal_override is None
+            and old_signal == 0
+            and signal
+            and cfg.max_holding_half_lives is not None
+            and np.isfinite(half_life)
+        ):
+            signal_state.max_holding_bars = cfg.max_holding_half_lives * half_life
+            signal_state.bars_held = 0
+        if (np.isfinite(beta) or signal_override is not None) and signal != old_signal:
+            sizing_beta = beta if np.isfinite(beta) else 1.0
+            sizing_target = sizer.size(
+                signal,
+                float(row["a_close"]),
+                float(row["b_close"]),
+                float(sizing_beta),
+                state,
+            )
+            reason = signal_state.last_event or _signal_event(old_signal, signal) or "exit"
+            pending[i + cfg.signal_lag_bars] = (*sizing_target, reason)
+        signals.append(
+            {
+                "ts_event": row["ts_event"],
+                "session_date": session,
+                "z": z,
+                "spread": spread,
+                "signal": signal,
+                "half_life": half_life,
+                "ou_mu": ou_mu,
+                "ou_sigma": ou_sigma,
+                "gated_bars": gated,
+                "gate_reason": gate_reason,
+            }
+        )
+        position = {
+            "ts_event": row["ts_event"],
+            "n_a": held_a,
+            "n_b": held_b,
+            "notional_a": abs(held_a) * float(row["a_close"]) * spec_a.multiplier_usd,
+            "notional_b": abs(held_b) * float(row["b_close"]) * spec_b.multiplier_usd,
+        }
+        if cfg.products == ("ES", "NQ"):
+            position.update({"n_es": held_a, "n_nq": held_b})
+        positions.append(position)
+        previous_beta = beta
+    if held_a or held_b:
+        row = bars.iloc[-1].copy()
+        row["a_open"] = row["a_close"]
+        row["b_open"] = row["b_close"]
+        trade_start = len(trades)
+        held_a, held_b = _execute_target(row, held_a, held_b, 0, 0, "eod_final", cfg, trades)
+        pnl_values[-1] -= sum(
+            float(cast(Any, trade.get("fees_usd", 0.0))) for trade in trades[trade_start:]
+        )
+        positions[-1]["n_a"] = held_a
+        positions[-1]["n_b"] = held_b
+        if cfg.products == ("ES", "NQ"):
+            positions[-1]["n_es"] = held_a
+            positions[-1]["n_nq"] = held_b
+    pnl = pd.Series(pnl_values, index=bars["ts_event"], name="pnl")
+    position_frame = pd.DataFrame(positions).set_index("ts_event")
+    equity = cfg.initial_capital_usd + pnl.cumsum()
+    daily = pnl.groupby(bars["session_date"].to_numpy()).sum()
+    trade_frame = pd.DataFrame(trades)
+    signal_frame = pd.DataFrame(signals).set_index("ts_event")
+    metrics = compute_metrics(pnl, daily, trade_frame, position_frame, cfg.initial_capital_usd)
+    gated_sessions = signal_frame.groupby("session_date")["gated_bars"].any()
+    metrics["entry_gated_fraction"] = float(gated_sessions.mean()) if len(gated_sessions) else 0.0
+    reasons = signal_frame["gate_reason"].fillna("")
+    metrics["cointegration_gated_fraction"] = (
+        float(reasons.str.contains("cointegration").mean()) if len(reasons) else 0.0
+    )
+    metrics["hedge_history_gated_fraction"] = (
+        float(reasons.str.contains("hedge_history").mean()) if len(reasons) else 0.0
+    )
+    metrics["half_life_gated_fraction"] = (
+        float(reasons.str.contains("half_life").mean()) if len(reasons) else 0.0
+    )
+    metrics["edge_gated_fraction"] = (
+        float(reasons.str.contains(r"(?:^|,)edge(?:,|$)", regex=True).mean())
+        if len(reasons)
+        else 0.0
+    )
+    metrics["ofi_gated_fraction"] = (
+        float(reasons.str.contains("ofi").mean()) if len(reasons) else 0.0
+    )
+    return SimulationResult(
+        position_frame,
+        pnl,
+        equity,
+        trade_frame,
+        daily,
+        metrics,
+        cfg,
+        pd.DataFrame(hedge_rows),
+        signal_frame,
+    )
+
+
+def _execute_target(
+    row: pd.Series,
+    old_a: int,
+    old_b: int,
+    target_a: int,
+    target_b: int,
+    reason: str,
+    cfg: SimulationConfig,
+    trades: list[dict[str, object]],
+    contract_overrides: dict[str, str] | None = None,
+) -> tuple[int, int]:
+    for product, old, target, reference, key in (
+        (cfg.products[0], old_a, target_a, float(row["a_open"]), "a"),
+        (cfg.products[1], old_b, target_b, float(row["b_open"]), "b"),
+    ):
+        delta = target - old
+        if not delta:
+            continue
+        spec = PRODUCTS[product]
+        side: Literal[1, -1] = 1 if delta > 0 else -1
+        fill = cfg.costs.fill_price(spec, reference, side)
+        fees = cfg.costs.fees_usd(spec, delta)
+        trades.append(
+            {
+                "ts_event": row["ts_event"],
+                "product": product,
+                "contract": (contract_overrides or {}).get(product, row[f"{key}_contract"]),
+                "side": side,
+                "qty": delta,
+                "fill_px": fill,
+                "reference_px": reference,
+                "fees_usd": fees,
+                "slippage_usd": abs(fill - reference) * abs(delta) * spec.multiplier_usd,
+                "reason": reason,
+            }
+        )
+    return target_a, target_b
+
+
+def _record_roll(
+    row: pd.Series,
+    previous_row: pd.Series | None,
+    product: str,
+    quantity: int,
+    cfg: SimulationConfig,
+    trades: list[dict[str, object]],
+) -> None:
+    key = "a" if product == cfg.products[0] else "b"
+    old_contract = (
+        row[f"{key}_contract"] if previous_row is None else previous_row[f"{key}_contract"]
+    )
+    new_contract = row[f"{key}_contract"]
+    if product == cfg.products[0]:
+        _execute_target(row, quantity, 0, 0, 0, "roll", cfg, trades, {product: str(old_contract)})
+        _execute_target(row, 0, 0, quantity, 0, "roll", cfg, trades, {product: str(new_contract)})
+    else:
+        _execute_target(row, 0, quantity, 0, 0, "roll", cfg, trades, {product: str(old_contract)})
+        _execute_target(row, 0, 0, 0, quantity, "roll", cfg, trades, {product: str(new_contract)})
+
+
+def _mark_pnl(
+    row: pd.Series,
+    i: int,
+    a_qty: int,
+    b_qty: int,
+    previous_a: float,
+    previous_b: float,
+    fills: list[dict[str, object]],
+    spec_a: Any,
+    spec_b: Any,
+    products: tuple[str, str],
+) -> float:
+    if i == 0:
+        return 0.0
+    total = 0.0
+    for product, quantity, previous, close, spec in (
+        (products[0], a_qty, previous_a, float(row["a_close"]), spec_a),
+        (products[1], b_qty, previous_b, float(row["b_close"]), spec_b),
+    ):
+        product_fills = [fill for fill in fills if fill["product"] == product]
+        running_qty = quantity
+        running_previous = previous
+        for fill in reversed(product_fills):
+            running_qty -= int(cast(Any, fill["qty"]))
+        for fill in product_fills:
+            fill_price = float(cast(Any, fill["fill_px"]))
+            delta = int(cast(Any, fill["qty"]))
+            old_qty = running_qty
+            total += old_qty * spec.multiplier_usd * (fill_price - running_previous)
+            running_qty += delta
+            running_previous = fill_price
+        total += running_qty * spec.multiplier_usd * (close - running_previous)
+    return total

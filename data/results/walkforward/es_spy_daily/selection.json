@@ -1,0 +1,166 @@
+{
+  "base": {
+    "oos": {
+      "fees_slippage": 13330.360512695312,
+      "max_dd_pct": 31.07045600878906,
+      "max_dd_usd": 310704.5600878906,
+      "pnl": -152952.71,
+      "round_trips": 23.0,
+      "sessions": 2438.0,
+      "sharpe": -0.1570733003287934,
+      "turnover": 44.90373311395294,
+      "win_rate": 0.391304347826087
+    },
+    "trial_id": 0
+  },
+  "base_oos": {
+    "fees_slippage": 13330.360512695312,
+    "max_dd_pct": 31.07045600878906,
+    "max_dd_usd": 310704.5600878906,
+    "pnl": -152952.71,
+    "round_trips": 23.0,
+    "sessions": 2438.0,
+    "sharpe": -0.1570733003287934,
+    "turnover": 44.90373311395294,
+    "win_rate": 0.391304347826087
+  },
+  "base_trial": 0,
+  "best_in_sample": {
+    "in_sample_sharpe": 0.3992001655443776,
+    "oos_sharpe": 0.5144496666032625,
+    "trial_id": 47
+  },
+  "best_in_sample_oos_sharpe": 0.5144496666032625,
+  "best_in_sample_sharpe": 0.3992001655443776,
+  "best_in_sample_trial": 47,
+  "recommended": {
+    "oos_over_test_span": {
+      "fees_slippage": 8849.94978149414,
+      "max_dd_pct": 12.189108722412097,
+      "max_dd_usd": 121891.08722412097,
+      "pnl": 252947.27010986328,
+      "round_trips": 16.0,
+      "sessions": 2438.0,
+      "sharpe": 0.5144496666032625,
+      "turnover": 31.687142160888175,
+      "win_rate": 0.625
+    },
+    "params": {
+      "coint_pvalue_gate": 0.07212086816980347,
+      "entry": 1.3045899256976279,
+      "exit_ratio": 0.25935897860775964,
+      "half_life_max_bars": 52.76371349294763,
+      "half_life_min_bars": 2.449861927471454,
+      "kalman_delta": 1.1183982490689318e-05,
+      "kalman_obs_var": 6.003954480311806e-08,
+      "max_holding_half_lives": 1.9480149572807224,
+      "min_edge_cost_multiple": 1.52419259026887,
+      "ofi_threshold": 0.577902539144899,
+      "stop_ratio": 1.7989558636605
+    },
+    "rank_stability": 4,
+    "trial_id": 47
+  },
+  "recommended_fold_sharpes": [
+    1.5166554295269647,
+    0.9424429437763869,
+    0.07578261935430244,
+    1.3767142362243716,
+    -0.6116879439239942
+  ],
+  "recommended_model": {
+    "fold_sharpes": [
+      1.5166554295269647,
+      0.9424429437763869,
+      0.07578261935430244,
+      1.3767142362243716,
+      -0.6116879439239942
+    ],
+    "oos_over_test_span": {
+      "fees_slippage": 8849.94978149414,
+      "max_dd_pct": 12.189108722412097,
+      "max_dd_usd": 121891.08722412097,
+      "pnl": 252947.27010986328,
+      "round_trips": 16.0,
+      "sessions": 2438.0,
+      "sharpe": 0.5144496666032625,
+      "turnover": 31.687142160888175,
+      "win_rate": 0.625
+    },
+    "params": {
+      "coint_pvalue_gate": 0.07212086816980347,
+      "entry": 1.3045899256976279,
+      "exit_ratio": 0.25935897860775964,
+      "half_life_max_bars": 52.76371349294763,
+      "half_life_min_bars": 2.449861927471454,
+      "kalman_delta": 1.1183982490689318e-05,
+      "kalman_obs_var": 6.003954480311806e-08,
+      "max_holding_half_lives": 1.9480149572807224,
+      "min_edge_cost_multiple": 1.52419259026887,
+      "ofi_threshold": 0.577902539144899,
+      "stop_ratio": 1.7989558636605
+    },
+    "rank_stability": 4,
+    "trial_id": 47
+  },
+  "recommended_oos": {
+    "fees_slippage": 8849.94978149414,
+    "max_dd_pct": 12.189108722412097,
+    "max_dd_usd": 121891.08722412097,
+    "pnl": 252947.27010986328,
+    "round_trips": 16.0,
+    "sessions": 2438.0,
+    "sharpe": 0.5144496666032625,
+    "turnover": 31.687142160888175,
+    "win_rate": 0.625
+  },
+  "recommended_params": {
+    "coint_pvalue_gate": 0.07212086816980347,
+    "entry": 1.3045899256976279,
+    "exit_ratio": 0.25935897860775964,
+    "half_life_max_bars": 52.76371349294763,
+    "half_life_min_bars": 2.449861927471454,
+    "kalman_delta": 1.1183982490689318e-05,
+    "kalman_obs_var": 6.003954480311806e-08,
+    "max_holding_half_lives": 1.9480149572807224,
+    "min_edge_cost_multiple": 1.52419259026887,
+    "ofi_threshold": 0.577902539144899,
+    "stop_ratio": 1.7989558636605
+  },
+  "recommended_rank_stability": 4,
+  "recommended_trial": 47,
+  "rule": "median(train Sharpe) - 0.5*IQR(train Sharpe), min trades per train fold; ties lowest trial id",
+  "selected_trials": [
+    {
+      "fold": 0,
+      "trial_id": 0
+    },
+    {
+      "fold": 1,
+      "trial_id": 46
+    },
+    {
+      "fold": 2,
+      "trial_id": 47
+    },
+    {
+      "fold": 3,
+      "trial_id": 9
+    },
+    {
+      "fold": 4,
+      "trial_id": 47
+    }
+  ],
+  "stitched_oos": {
+    "fees_slippage": 14879.063671874997,
+    "max_dd_pct": 21.291730997558602,
+    "max_dd_usd": 212917.30997558602,
+    "pnl": -102585.73492431644,
+    "round_trips": 26.0,
+    "sessions": 2438.0,
+    "sharpe": -0.1613553375501917,
+    "turnover": 52.18816682468509,
+    "win_rate": 0.34615384615384615
+  }
+}

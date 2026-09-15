@@ -6,9 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-def compute_spread(
-    y: pd.Series, x: pd.Series, beta: float, alpha: float = 0.0
-) -> pd.Series:
+def compute_spread(y: pd.Series, x: pd.Series, beta: float, alpha: float = 0.0) -> pd.Series:
     """Residual spread ``y - alpha - beta * x``."""
     return y - alpha - beta * x
 

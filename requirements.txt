@@ -3,6 +3,9 @@ pandas>=2.0
 scipy>=1.10
 statsmodels>=0.14
 matplotlib>=3.7
+pyarrow>=14
 yfinance>=0.2.40
 pytest>=7.4
 ruff>=0.1
+mypy>=1.8
+pandas-stubs

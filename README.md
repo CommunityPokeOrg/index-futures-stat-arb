@@ -34,59 +34,285 @@ cp .env.example .env   # fill in DATABENTO_API_KEY if using Databento
 
 ## Usage
 
-Open the research notebook:
+The reproducible command-line pipeline is configured with TOML files:
 
 ```bash
-jupyter notebook notebooks/es_nq_stat_arb_research.ipynb
+ifsa ingest --config configs/ingest_example.toml --offline --no-resume
+ifsa rolls --config configs/ingest_example.toml --rule volume \
+  --out data/reference/roll_calendar
+ifsa simulate --config configs/sim_synthetic.toml --offline --out data/results
 ```
 
-Or use the library directly:
-
-```python
-from index_futures_stat_arb import load_prices, walk_forward_backtest
-
-prices = load_prices(start="2018-01-01")          # yfinance ES=F / NQ=F
-results = walk_forward_backtest(prices, split=0.7)
-print(results["test"].metrics)
-```
+The original research helpers and notebooks remain available for exploratory
+cointegration, OU, and walk-forward work.
 
 ## Data
 
-Two ingestion paths are provided:
+The ingestion pipeline requests per-contract CME `ohlcv-1m` data, normalizes
+timestamps and prices, labels CME sessions/RTH, validates OHLC and duplicate
+keys, and writes zstd-compressed Hive-partitioned Parquet:
 
-- **yfinance proxies** (default): `ES=F` / `NQ=F` continuous front-month futures
-  tickers, falling back to `SPY` / `QQQ` ETFs if the futures tickers are
-  unavailable.
-- **Databento**: real CME Globex data via `DATABENTO_API_KEY` and
-  `DATABENTO_DATASET` (default `GLBX.MDP3`), using continuous contracts
-  (`stype_in="continuous"`).
+```text
+data/raw/source=<source>/dataset=<dataset>/schema=<schema>/
+  product=ES/contract=ESH6/date=YYYY-MM-DD/part-0.parquet
+```
 
-Caveats to keep in mind:
+Use `DATABENTO_API_KEY` in the environment for the real Databento path; keys
+are never written to manifests or logs. Chunk requests are session-aligned and
+resume from atomic checkpoints. Each completed dataset has a manifest containing
+the deterministic dataset ID, row count, configuration, and SHA-256 for every
+Parquet file. The offline `--offline` path uses clearly labelled deterministic
+synthetic fixtures and never accesses the network.
 
-- Continuous contracts have **roll artifacts**; the PnL of a naive spread is not
-  exactly tradable.
-- yfinance data quality is best-effort; expect gaps and occasional bad prints.
-- ETF proxies introduce **survivorship/tracking** differences vs futures.
-- No tick data — daily bars only, so intraday execution is not modelled.
+## Roll calendar and continuous series
+
+`ifsa rolls` builds explicit per-product calendars using calendar, volume,
+open-interest, or fixed-k rules. Volume and open-interest decisions use only
+the prior completed session, include an earliest-roll constraint, and have a
+CME-Monday calendar guard. ES and NQ calendars are joined so the joint roll
+date is visible in `es.parquet`, `nq.parquet`, and `joint.parquet`.
+
+`build_continuous` supports none, Panama, and ratio adjustments, with
+as-of-dated and forward-adjusted modes. Simulation uses forward adjustment so
+historical prices do not change when later rolls are discovered.
+
+## Simulation
+
+`ifsa simulate` loads aligned ES/NQ bars, resamples 1-minute data (default
+5-minute bars), optionally filters RTH, fits a log-price hedge ratio using only
+completed sessions, and runs an incremental signal/execution loop. A decision
+made at bar `i` close fills at bar `i + signal_lag_bars` open, then marks at the
+bar close. Roll close/reopen trades occur on the first bar of a roll session.
+Costs include configurable commission, exchange fees, tick slippage, and
+half-spread assumptions. Fixed-contract, dollar-neutral, and volatility-target
+sizers are available.
+
+The engine has a cursor-based future-access guard and the test suite includes
+deterministic no-lookahead checks. A run writes `report.json`, `trades.csv`,
+`equity.csv`, and `daily.csv` below a timestamp/config-hash run directory.
+
+Synthetic output is for pipeline and test validation only. It is **not evidence
+of a tradeable edge**, realistic market impact, or expected live performance.
+
+## Real data via Yahoo Finance (no API key)
+
+Yahoo's continuous front-month ES=F/NQ=F series can be fetched without an API
+key:
+
+```bash
+ifsa simulate-yahoo --config configs/sim_yahoo_daily.toml --out data/results
+ifsa simulate-yahoo --config configs/sim_yahoo_5m.toml --out data/results
+```
+
+Supported intervals and Yahoo retention limits are:
+
+| Interval | Maximum history | Maximum request span |
+|---|---:|---:|
+| 1m | 30 days | 7 days |
+| 2m, 5m, 15m, 30m | 60 days | 60 days |
+| 60m, 1h | 730 days | 730 days |
+| 1d | unlimited | unlimited |
+
+The adapter clips requests to these limits, splits long requests into bounded
+windows, validates bars, and caches Parquet plus metadata sidecars. Yahoo does
+not provide the per-contract volume needed for this project's explicit roll
+calendar, so these are Yahoo's own continuous contracts. Prices are unadjusted
+and may contain roll gaps, and Yahoo's roll timing is not necessarily the CME
+calendar used by the per-contract pipeline. In particular, 1-minute history is
+only approximately 30 days.
+
+Reports identify the source explicitly with `data_source` and include the
+effective range and fetch metadata. Synthetic and Yahoo results must not be
+treated as interchangeable evidence of a tradeable edge.
+
+## Refined execution methods
+
+The execution engine supports fixed session OLS, a random-walk Kalman hedge,
+and rolling Engle–Granger hedge estimates. Optional cointegration and OU
+half-life gates block new entries when the fitted relationship is not usable;
+exits, stops, roll handling, and delayed fills remain active. OU threshold mode
+adapts the spread mean and stationary scale without tuning thresholds for
+profitability. Reports record hedge estimates, gate reasons, OU diagnostics,
+and entry-gating fractions. Volatility targeting uses the prior-bar hedge ratio
+to estimate the PnL of a dollar-neutral ES/NQ unit.
+
+Basis pairs can use `hedge_method = "unit"`, which fixes the log hedge ratio
+at one and tracks only the log-basis level with a one-state Kalman filter.
+This avoids the alpha/beta identification problem when the spot log price
+barely moves. `max_leg_notional_usd` applies a proportional post-scaling
+leverage cap to both legs.
+
+Method sources: Kalman hedge (Elliott, van der Hoek & Malcolm 2005; Chan 2013), OU
+s-scores and half-life thresholds (Avellaneda & Lee 2010; Bertram 2010; Leung & Li 2015,
+arXiv:1411.5062), cointegration gating (Engle & Granger 1987; Vidyamurthy 2004), survey
+(Krauss 2017). Real-data baseline-vs-refined evidence and limitations:
+`docs/results/2026-09-14_refined_method_real_data.md`.
+
+## Index-vs-ETF basis
+
+The Yahoo path also supports cash-and-carry pairs with the index future as
+leg A and its ETF as leg B: ES=F/SPY and NQ=F/QQQ. ES is $50 per index point
+and NQ is $20 per point; SPY and QQQ are modelled as $1 per share with
+$0.01 ticks. Dollar-neutral sizing converts futures notional into ETF shares
+using both prices and multipliers, preserving fractional hedge units until
+the final integer fill.
+
+When enabled, carry uses a causal one-session-lagged ^IRX 13-week T-bill
+discount-yield approximation and trailing per-share ETF dividends by ex-date:
+`fair future = spot * exp((r-q)*tau)`, with ACT/365 time to the next quarterly
+expiry. ETF fills use one tick of slippage plus a half-tick spread (1.5 cents)
+and a $0.005/share commission. Fallback constants are 4% risk-free, 1.2% SPY
+dividends, and 0.6% QQQ dividends when Yahoo rate or dividend data cannot be
+fetched.
+
+```bash
+ifsa diagnose-yahoo --config configs/sim_yahoo_es_spy_daily_refined.toml \
+  --out data/results/diag_es_spy_daily
+ifsa simulate-yahoo --config configs/sim_yahoo_es_spy_daily_refined.toml \
+  --out data/results
+ifsa compare --runs data/results/<run1> data/results/<run2> \
+  --out data/results/compare_etf.md
+```
+
+Limitations include Yahoo ES=F being an unadjusted continuous front-month
+series; SPY daily closes at 16:00 ET versus the ES=F daily settlement label;
+the ^IRX discount-yield approximation; dividends applied by ex-date; roughly
+60-day 5-minute retention; no ETF borrow or financing cost; and no margin
+modelling. Real-data diagnostics, baseline/Kalman/unit-hedge comparisons, and
+limitations: `docs/results/2026-09-15_index_vs_etf_basis_real_data.md`.
+
+## Walk-forward evaluation
+
+The walk-forward command evaluates sampled hyperparameters on anchored,
+contiguous test folds. Each trial is simulated once over the full causal input
+range; daily PnL is then sliced into folds. After the first test fold, a trial
+is eligible only when it has at least the configured minimum number of trades
+in every prior training fold. Selection maximizes
+`median(training Sharpe) - 0.5 * IQR(training Sharpe)`, with ties resolved by
+the lowest trial id. Fold-zero uses the base configuration. The final
+recommended model maximizes median OOS-fold Sharpe among models trading in at
+least half of the folds.
+
+Entry filters can require the expected OU (or fixed rolling-mean) deviation to
+cover a multiple of modelled round-trip costs with `min_edge_cost_multiple`.
+`ofi_threshold` is an optional causal entry filter using a
+**bar-derived order-flow-imbalance proxy**:
+`sign(close-open) * volume`, normalized by rolling volume. Yahoo bars contain
+no order-book data, so this is not true order-flow or order-book imbalance.
+Both filters affect entries only; exits and stops remain active.
+
+```bash
+ifsa walkforward --config configs/wf_es_spy_daily.toml \
+  --out data/results/walkforward/es_spy_daily
+ifsa walkforward --config configs/wf_nq_qqq_daily.toml \
+  --out data/results/walkforward/nq_qqq_daily
+ifsa walkforward --config configs/wf_es_spy_5m.toml \
+  --out data/results/walkforward/es_spy_5m
+ifsa walkforward --config configs/wf_nq_qqq_5m.toml \
+  --out data/results/walkforward/nq_qqq_5m
+```
+
+Each output directory contains deterministic CSV/JSON/Markdown summaries and
+small PNG diagnostics, including the stitched selected-per-fold OOS equity
+curve and the base-configuration benchmark.
+
+Real-data walk-forward results, selection rule, and limitations:
+`docs/results/2026-09-15_walkforward_evaluation.md`.
+
+## Results dashboard (GitHub Pages)
+
+`dashboard/` is a static Vite + React showcase of the committed walk-forward artefacts
+(stitched OOS metrics, per-fold selection, trial tables, plots, and explicit small-sample /
+5-minute / no-edge warnings). It reads `data/results/walkforward/**` at build time — nothing
+is recomputed in the browser.
+
+```bash
+cd dashboard
+npm ci
+npm run dev       # local dev server
+npm run build     # -> dashboard/dist (relative base, works at any Pages subpath)
+npm run preview   # serve the built site
+npm test          # build + dist validation (relative assets, plots, exact metrics embedded)
+```
+
+`.github/workflows/pages.yml` builds and validates on pull requests and deploys to GitHub
+Pages from the default branch (`actions/upload-pages-artifact` + `actions/deploy-pages`).
+Enable once under **Settings → Pages → Source: GitHub Actions**; the site is then served at
+`https://<org>.github.io/index-futures-stat-arb/`. See `dashboard/README.md`.
+
+## Research plan
+
+Index of research documents: `docs/research/README.md`. For local continuation start with
+`docs/research/02_consolidated_findings_and_local_continuation.md` (all produced metrics,
+Kalman/pairs engine specification, retail viability analysis, setup and commands, acceptance
+criteria). `docs/research/next_steps_validation_protocol.md` records the current honest conclusion
+(ES/SPY OOS Sharpe −0.16; NQ/QQQ 0.46, t ≈ 1.4; 5m uninformative), falsifiable hypotheses,
+and the validation protocol (untouched holdout, nested walk-forward, embargo, deflated
+Sharpe, parameter stability, cost/capacity stress, regime analysis, institutional-data
+replication) that any future claim of edge must pass. Monte Carlo findings and feasibility:
+`docs/results/2026-09-15_montecarlo_evaluation.md`.
+
+## Monte Carlo harness
+
+The `ifsa montecarlo` commands are deterministic **harness / power / stress
+tests, never evidence of real edge**. They resample observed daily PnL,
+exercise the existing engine on synthetic OU or random-walk basis paths, or
+calculate multiple-testing-adjusted Sharpe statistics. Outputs are written as
+`montecarlo.json`, `montecarlo.md`, and a compact `sharpe_distribution.png`.
+
+```bash
+ifsa montecarlo bootstrap \
+  --walkforward-dir data/results/walkforward/nq_qqq_daily \
+  --n-paths 10000 \
+  --out data/results/montecarlo/nq_qqq_daily_bootstrap
+
+ifsa montecarlo synthetic \
+  --config configs/sim_yahoo_nq_qqq_daily_refined.toml \
+  --kappa 0 \
+  --sigma 0.00239 \
+  --n-paths 20 \
+  --workers 4 \
+  --out data/results/montecarlo/nq_qqq_null
+
+ifsa montecarlo deflate \
+  --walkforward-dir data/results/walkforward/nq_qqq_daily \
+  --out data/results/montecarlo/nq_qqq_daily_deflate
+```
+
+Circular block bootstrap paths preserve local dependence; the default block
+length is `ceil(n**(1/3))`. Synthetic paths use jointly resampled real
+leg-B returns and volumes. A zero-kappa synthetic path is a random-walk null,
+while positive kappa is a power harness. Neither mode establishes
+profitability or a tradable edge.
 
 ## Project layout
 
-```
-data/                       # local data artifacts (gitignored)
-notebooks/                  # research notebooks
-src/index_futures_stat_arb/ # library: data, cointegration, ou, signals, backtest
-tests/                      # pytest suite (offline, synthetic data)
+```text
+configs/                    # ingestion, roll, and simulation TOML
+data/                       # local artifacts, manifests, and checkpoints
+src/index_futures_stat_arb/ # ingestion, contracts, rolls, continuous, execution
+tests/                      # offline unit and integration tests
 ```
 
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
 pytest -q
 ruff check src tests
+ruff format --check src tests
+mypy src
 ```
 
-All tests run offline against synthetic cointegrated data; no network required.
+All tests are offline and use deterministic fixtures or hand-built bars.
+
+## Limitations
+
+- No live Databento run is performed in this environment.
+- The CME holiday calendar is an explicit approximation; early closes are not
+  modelled.
+- The default one-tick slippage and half-spread values are assumptions.
+- Intrabar fills, limit orders, and queue position are not modelled.
+- Daily settlement differs from close-to-close marking and is not modelled.
 
 ## Risk disclaimer
 

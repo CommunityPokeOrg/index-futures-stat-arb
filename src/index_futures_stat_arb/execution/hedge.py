@@ -10,7 +10,41 @@ import pandas as pd
 
 from ..cointegration import engle_granger
 
-HedgeMethod = Literal["ols", "kalman", "rolling_eg"]
+HedgeMethod = Literal["ols", "kalman", "rolling_eg", "unit"]
+
+
+@dataclass
+class KalmanLevel:
+    """Random-walk Kalman filter for a fixed unit hedge's log-basis level."""
+
+    delta: float = 1e-5
+    obs_var: float = 1e-4
+    alpha: float = 0.0
+    cov: float = 1.0
+    _predicted: float | None = field(default=None, init=False, repr=False)
+    _innovation_var: float | None = field(default=None, init=False, repr=False)
+
+    def predict(self) -> tuple[float, float]:
+        if not 0 < self.delta < 1:
+            raise ValueError("delta must be between zero and one")
+        process_var = self.delta / (1.0 - self.delta)
+        self.cov += process_var
+        self._predicted = self.alpha
+        self._innovation_var = self.cov + self.obs_var
+        return self.alpha, self._innovation_var
+
+    def update(self, observation: float) -> float:
+        if self._predicted is None or self._innovation_var is None:
+            self.predict()
+        assert self._predicted is not None
+        assert self._innovation_var is not None
+        innovation = float(observation - self._predicted)
+        gain = self.cov / self._innovation_var
+        self.alpha += gain * innovation
+        self.cov -= gain * self.cov
+        self._predicted = None
+        self._innovation_var = None
+        return innovation
 
 
 @dataclass

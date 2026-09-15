@@ -136,6 +136,12 @@ profitability. Reports record hedge estimates, gate reasons, OU diagnostics,
 and entry-gating fractions. Volatility targeting uses the prior-bar hedge ratio
 to estimate the PnL of a dollar-neutral ES/NQ unit.
 
+Basis pairs can use `hedge_method = "unit"`, which fixes the log hedge ratio
+at one and tracks only the log-basis level with a one-state Kalman filter.
+This avoids the alpha/beta identification problem when the spot log price
+barely moves. `max_leg_notional_usd` applies a proportional post-scaling
+leverage cap to both legs.
+
 Method sources: Kalman hedge (Elliott, van der Hoek & Malcolm 2005; Chan 2013), OU
 s-scores and half-life thresholds (Avellaneda & Lee 2010; Bertram 2010; Leung & Li 2015,
 arXiv:1411.5062), cointegration gating (Engle & Granger 1987; Vidyamurthy 2004), survey

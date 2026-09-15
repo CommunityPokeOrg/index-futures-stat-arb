@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+from index_futures_stat_arb.contracts import PRODUCTS
 from index_futures_stat_arb.execution.sizing import (
     DollarNeutralSizer,
     FixedContracts,
@@ -76,6 +77,25 @@ def test_vol_target_scales_fractional_dollar_neutral_unit() -> None:
     )
     state = SizerState(pd.Series([0.0, 1.0]))
     assert sizer.size(1, 2100.0, 4450.0, 0.75, state) == (26, -23)
+
+
+def test_vol_target_respects_leg_notional_cap() -> None:
+    sizer = VolTargetSizer(
+        target_daily_vol_usd=100000.0,
+        lookback_sessions=2,
+        max_units_a=50,
+        max_leg_notional_usd=2_000_000.0,
+        spec_a=PRODUCTS["ES"],
+        spec_b=PRODUCTS["NQ"],
+        inner=DollarNeutralSizer(
+            es_contracts=1,
+            spec_a=PRODUCTS["ES"],
+            spec_b=PRODUCTS["NQ"],
+        ),
+    )
+    result = sizer.size(1, 5000.0, 18000.0, 1.0, SizerState(pd.Series([0.0, 1.0])))
+    assert abs(result[0]) <= 8
+    assert abs(result[0] * 5000.0 * 50 - abs(result[1]) * 18000.0 * 20) <= 18000.0 * 20
 
 
 @pytest.mark.parametrize("name", ["fixed", "dollar_neutral"])

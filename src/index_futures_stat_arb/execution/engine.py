@@ -18,7 +18,7 @@ from ..ingest.databento import read_partitioned
 from ..ou import fit_ou
 from ..rolls import RollConfig, build_roll_calendar, daily_from_bars, joint_roll_calendar
 from .costs import CostModel
-from .hedge import HedgeMethod, KalmanHedge, rolling_engle_granger
+from .hedge import HedgeMethod, KalmanHedge, KalmanLevel, rolling_engle_granger
 from .metrics import compute_metrics
 from .sizing import Sizer, SizerSpec, SizerState, build_sizer
 
@@ -62,7 +62,7 @@ class SimulationConfig:
     sizer: SizerSpec = field(default_factory=SizerSpec)
 
     def __post_init__(self) -> None:
-        if self.hedge_method not in {"ols", "kalman", "rolling_eg"}:
+        if self.hedge_method not in {"ols", "kalman", "rolling_eg", "unit"}:
             raise ValueError(f"unsupported hedge method: {self.hedge_method!r}")
         if self.threshold_mode not in {"fixed", "ou"}:
             raise ValueError(f"unsupported threshold mode: {self.threshold_mode!r}")
@@ -346,6 +346,7 @@ def run_simulation(
     previous_beta = float("nan")
     alpha = beta = float("nan")
     kalman: KalmanHedge | None = None
+    level: KalmanLevel | None = None
     session_spreads: list[float] = []
     log_a_history: list[float] = []
     log_b_history: list[float] = []
@@ -403,7 +404,16 @@ def run_simulation(
                 y = np.log(history["a_close"].to_numpy())
                 if cfg.carry_adjust and "carry" in history:
                     y = y - history["carry"].to_numpy()
-                if cfg.hedge_method == "rolling_eg":
+                if cfg.hedge_method == "unit":
+                    beta = 1.0
+                    alpha = float(np.mean(y - x))
+                    pvalue = float("nan")
+                    if cfg.coint_pvalue_gate is not None:
+                        try:
+                            pvalue = adf_test(pd.Series(y - x))["pvalue"]
+                        except Exception:
+                            pvalue = float("nan")
+                elif cfg.hedge_method == "rolling_eg":
                     fit = rolling_engle_granger(y, x)
                     alpha, beta, pvalue = fit.alpha, fit.beta, fit.pvalue
                 else:
@@ -427,6 +437,15 @@ def run_simulation(
                             pvalue = adf_test(pd.Series(gate_window))["pvalue"]
                         except Exception:
                             pvalue = float("nan")
+                if cfg.hedge_method == "unit":
+                    if level is None and np.isfinite(alpha):
+                        level = KalmanLevel(
+                            delta=cfg.kalman_delta,
+                            obs_var=cfg.kalman_obs_var,
+                            alpha=float(alpha),
+                        )
+                    if level is not None:
+                        alpha, beta = level.alpha, 1.0
                 if cfg.coint_pvalue_gate is not None and (
                     not np.isfinite(pvalue) or pvalue >= cfg.coint_pvalue_gate
                 ):
@@ -434,7 +453,7 @@ def run_simulation(
                     session_gate_reason = "cointegration"
                 else:
                     session_entry_gate = True
-                if cfg.hedge_method != "kalman":
+                if cfg.hedge_method not in {"kalman", "unit"}:
                     hedge_rows.append(
                         {
                             "session_date": session,
@@ -444,7 +463,7 @@ def run_simulation(
                         }
                     )
                 if (
-                    cfg.hedge_method != "kalman"
+                    cfg.hedge_method not in {"kalman", "unit"}
                     and not cfg.z_reset_each_session
                     and cfg.recompute_z_window_on_refit
                 ):
@@ -460,6 +479,8 @@ def run_simulation(
                     session_spreads = []
             if cfg.hedge_method == "kalman" and kalman is not None:
                 alpha, beta = kalman.alpha, kalman.beta
+            elif cfg.hedge_method == "unit" and level is not None:
+                alpha, beta = level.alpha, 1.0
         trade_start = len(trades)
         if i in pending:
             target_a, target_b, reason = pending.pop(i)
@@ -518,6 +539,11 @@ def run_simulation(
             kalman.predict(log_b)
             spread = log_a - prior_alpha - prior_beta * log_b
             prior_window = state_window(prior_alpha, prior_beta, session)
+        elif level is not None:
+            prior_alpha = level.alpha
+            level.predict()
+            spread = log_a - log_b - prior_alpha
+            prior_window = state_window(prior_alpha, 1.0, session)
         else:
             spread = (
                 float(log_a - alpha - beta * log_b) if np.isfinite(alpha + beta) else float("nan")
@@ -563,6 +589,17 @@ def run_simulation(
         if kalman is not None:
             kalman.update(log_a, log_b)
             alpha, beta = kalman.alpha, kalman.beta
+            hedge_rows.append(
+                {
+                    "session_date": session,
+                    "ts_event": row["ts_event"],
+                    "alpha": alpha,
+                    "beta": beta,
+                }
+            )
+        elif level is not None:
+            level.update(log_a - log_b)
+            alpha, beta = level.alpha, 1.0
             hedge_rows.append(
                 {
                     "session_date": session,
@@ -628,7 +665,13 @@ def run_simulation(
                 "gate_reason": gate_reason,
             }
         )
-        position = {"ts_event": row["ts_event"], "n_a": held_a, "n_b": held_b}
+        position = {
+            "ts_event": row["ts_event"],
+            "n_a": held_a,
+            "n_b": held_b,
+            "notional_a": abs(held_a) * float(row["a_close"]) * spec_a.multiplier_usd,
+            "notional_b": abs(held_b) * float(row["b_close"]) * spec_b.multiplier_usd,
+        }
         if cfg.products == ("ES", "NQ"):
             position.update({"n_es": held_a, "n_nq": held_b})
         positions.append(position)

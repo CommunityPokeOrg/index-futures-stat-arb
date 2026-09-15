@@ -73,6 +73,11 @@ def compute_metrics(
         else 0.0,
         "max_gross_units_a": float(positions["n_a"].abs().max()) if len(positions) else 0.0,
         "max_gross_units_b": float(positions["n_b"].abs().max()) if len(positions) else 0.0,
+        "max_gross_notional_usd": float(
+            positions[["notional_a", "notional_b"]].fillna(0).sum(axis=1).max()
+        )
+        if {"notional_a", "notional_b"} <= set(positions.columns) and len(positions)
+        else 0.0,
     }
 
 

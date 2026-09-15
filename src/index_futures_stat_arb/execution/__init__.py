@@ -7,7 +7,7 @@ from .engine import (
     load_pair_bars,
     run_simulation,
 )
-from .hedge import HedgeMethod, KalmanHedge, RollingEGResult, rolling_engle_granger
+from .hedge import HedgeMethod, KalmanHedge, KalmanLevel, RollingEGResult, rolling_engle_granger
 from .lookahead import LookaheadError, assert_no_lookahead
 from .metrics import compute_metrics
 from .sizing import (
@@ -26,6 +26,7 @@ __all__ = [
     "FixedContracts",
     "HedgeMethod",
     "KalmanHedge",
+    "KalmanLevel",
     "LookaheadError",
     "SimulationConfig",
     "SimulationResult",

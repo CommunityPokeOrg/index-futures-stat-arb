@@ -97,6 +97,11 @@ def load_simulation_config(path: str | Path) -> Any:
     values["sizer"] = SizerSpec(
         name=sizer_values.get("name", "fixed"),
         kwargs={key: value for key, value in sizer_values.items() if key != "name"},
+        max_leg_notional_usd=(
+            float(sizer_values["max_leg_notional_usd"])
+            if sizer_values.get("max_leg_notional_usd") is not None
+            else None
+        ),
     )
     values["roll"] = RollConfig(**payload.get("rolls", {}))
     if "products" in values:

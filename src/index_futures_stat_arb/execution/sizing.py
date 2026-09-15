@@ -55,6 +55,7 @@ class DollarNeutralSizer:
     max_units_a: int = 20
     max_units_b: int | None = None
     max_contracts: int | None = None
+    max_leg_notional_usd: float | None = None
     spec_a: ProductSpec = field(default_factory=lambda: PRODUCTS["ES"])
     spec_b: ProductSpec = field(default_factory=lambda: PRODUCTS["NQ"])
 
@@ -85,6 +86,15 @@ class DollarNeutralSizer:
         if signal == 0:
             return 0, 0
         es, nq = self.unit(signal, es_price, nq_price, beta)
+        if self.max_leg_notional_usd is not None:
+            notional = max(
+                abs(es) * es_price * self.spec_a.multiplier_usd,
+                abs(nq) * nq_price * self.spec_b.multiplier_usd,
+            )
+            if notional > self.max_leg_notional_usd:
+                scale = self.max_leg_notional_usd / notional
+                es *= scale
+                nq *= scale
         nq_magnitude = max(1, round(abs(nq)))
         if self.max_units_b is not None:
             nq_magnitude = min(nq_magnitude, self.max_units_b)
@@ -100,6 +110,9 @@ class VolTargetSizer:
     max_units_a: int = 20
     max_units_b: int | None = None
     max_contracts: int | None = None
+    max_leg_notional_usd: float | None = None
+    spec_a: ProductSpec = field(default_factory=lambda: PRODUCTS["ES"])
+    spec_b: ProductSpec = field(default_factory=lambda: PRODUCTS["NQ"])
     inner: Sizer = field(default_factory=FixedContracts)
 
     def __post_init__(self) -> None:
@@ -139,6 +152,13 @@ class VolTargetSizer:
         if self.max_units_b is not None:
             limits.append(self.max_units_b / max(abs(unit_nq), 1))
         scale = min(scale, *limits)
+        if self.max_leg_notional_usd is not None:
+            notional = max(
+                abs(unit_es * scale) * es_price * self.spec_a.multiplier_usd,
+                abs(unit_nq * scale) * nq_price * self.spec_b.multiplier_usd,
+            )
+            if notional > self.max_leg_notional_usd:
+                scale *= self.max_leg_notional_usd / notional
         return integerize(unit_es * scale, unit_nq * scale)
 
 
@@ -146,6 +166,7 @@ class VolTargetSizer:
 class SizerSpec:
     name: str = "fixed"
     kwargs: dict[str, object] = field(default_factory=dict)
+    max_leg_notional_usd: float | None = None
 
 
 def build_sizer(
@@ -170,6 +191,7 @@ def build_sizer(
             ),
             spec_a=spec_a,
             spec_b=spec_b,
+            max_leg_notional_usd=spec.max_leg_notional_usd,
         )
     if spec.name == "vol_target":
         inner = kwargs.pop("inner", FixedContracts())
@@ -186,6 +208,9 @@ def build_sizer(
             max_units_b=(
                 int(kwargs["max_units_b"]) if kwargs.get("max_units_b") is not None else None
             ),
+            max_leg_notional_usd=spec.max_leg_notional_usd,
+            spec_a=spec_a,
+            spec_b=spec_b,
             inner=inner,
         )
     raise ValueError(f"unknown sizer: {spec.name}")

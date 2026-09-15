@@ -1,4 +1,4 @@
-# REAL Yahoo data: continuous front-month prices; Yahoo retention limits apply.
+# Identifiability comparison: unconstrained (beta, alpha) Kalman hedge.
 [simulation]
 products = ["ES", "SPY"]
 start = "2015-01-01"
@@ -17,7 +17,7 @@ mask_roll_sessions = false
 adjust = "none"
 z_reset_each_session = false
 carry_adjust = true
-hedge_method = "unit"
+hedge_method = "kalman"
 kalman_delta = 1e-5
 kalman_obs_var = 1e-6
 coint_pvalue_gate = 0.10
@@ -54,4 +54,3 @@ rate_symbol = "IRX"
 carry_adjust = true
 fallback_risk_free_rate = 0.04
 fallback_dividend_yield = 0.012
-interval = "1d"

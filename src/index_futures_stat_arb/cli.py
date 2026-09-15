@@ -412,7 +412,7 @@ def _run_id(config_json: str) -> str:
 
 def _yahoo_diagnostics(bars: pd.DataFrame, config: Any) -> dict[str, object]:
     from .cointegration import adf_test
-    from .execution.hedge import KalmanHedge
+    from .execution.hedge import KalmanHedge, KalmanLevel
     from .ou import fit_ou
 
     a = np.log(bars["a_close"].astype(float))
@@ -493,6 +493,16 @@ def _yahoo_diagnostics(bars: pd.DataFrame, config: Any) -> dict[str, object]:
         kalman.predict(float(x_value))
         kalman.update(float(y_value), float(x_value))
         beta_path.append(kalman.beta)
+    unit_level = KalmanLevel(
+        delta=config.kalman_delta,
+        obs_var=config.kalman_obs_var,
+        alpha=float(np.mean(np.asarray(a - carry) - np.asarray(b))),
+    )
+    unit_alpha_path: list[float] = []
+    for x_value, y_value in zip(np.asarray(b), np.asarray(a - carry), strict=True):
+        unit_level.predict()
+        unit_level.update(float(y_value - x_value))
+        unit_alpha_path.append(unit_level.alpha)
     return {
         "rows": {"a": int(len(bars)), "b": int(len(bars))},
         "effective_range": {
@@ -519,6 +529,12 @@ def _yahoo_diagnostics(bars: pd.DataFrame, config: Any) -> dict[str, object]:
             "min": min(beta_path) if beta_path else float("nan"),
             "median": float(np.median(beta_path)) if beta_path else float("nan"),
             "max": max(beta_path) if beta_path else float("nan"),
+            "delta": config.kalman_delta,
+        },
+        "unit_alpha": {
+            "min": min(unit_alpha_path) if unit_alpha_path else float("nan"),
+            "median": float(np.median(unit_alpha_path)) if unit_alpha_path else float("nan"),
+            "max": max(unit_alpha_path) if unit_alpha_path else float("nan"),
             "delta": config.kalman_delta,
         },
     }

@@ -100,7 +100,25 @@ class DollarNeutralSizer:
             nq_magnitude = min(nq_magnitude, self.max_units_b)
         es_magnitude = min(abs(round(es)), self.max_units_a)
         es = int(np.sign(es) * es_magnitude)
-        return es, -signal * nq_magnitude
+        nq = -signal * nq_magnitude
+        while (
+            self.max_leg_notional_usd is not None
+            and max(
+                abs(es) * es_price * self.spec_a.multiplier_usd,
+                abs(nq) * nq_price * self.spec_b.multiplier_usd,
+            )
+            > self.max_leg_notional_usd
+        ):
+            if (
+                abs(es) * es_price * self.spec_a.multiplier_usd
+                >= abs(nq) * nq_price * self.spec_b.multiplier_usd
+            ):
+                es -= int(np.sign(es))
+            elif nq:
+                nq -= int(np.sign(nq))
+            else:
+                break
+        return es, nq
 
 
 @dataclass(frozen=True)
@@ -159,7 +177,25 @@ class VolTargetSizer:
             )
             if notional > self.max_leg_notional_usd:
                 scale *= self.max_leg_notional_usd / notional
-        return integerize(unit_es * scale, unit_nq * scale)
+        result_es, result_nq = integerize(unit_es * scale, unit_nq * scale)
+        while (
+            self.max_leg_notional_usd is not None
+            and max(
+                abs(result_es) * es_price * self.spec_a.multiplier_usd,
+                abs(result_nq) * nq_price * self.spec_b.multiplier_usd,
+            )
+            > self.max_leg_notional_usd
+        ):
+            if (
+                abs(result_es) * es_price * self.spec_a.multiplier_usd
+                >= abs(result_nq) * nq_price * self.spec_b.multiplier_usd
+            ):
+                result_es -= int(np.sign(result_es))
+            elif result_nq:
+                result_nq -= int(np.sign(result_nq))
+            else:
+                break
+        return result_es, result_nq
 
 
 @dataclass(frozen=True)

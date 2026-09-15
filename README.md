@@ -142,6 +142,38 @@ arXiv:1411.5062), cointegration gating (Engle & Granger 1987; Vidyamurthy 2004),
 (Krauss 2017). Real-data baseline-vs-refined evidence and limitations:
 `docs/results/2026-09-14_refined_method_real_data.md`.
 
+## Index-vs-ETF basis
+
+The Yahoo path also supports cash-and-carry pairs with the index future as
+leg A and its ETF as leg B: ES=F/SPY and NQ=F/QQQ. ES is $50 per index point
+and NQ is $20 per point; SPY and QQQ are modelled as $1 per share with
+$0.01 ticks. Dollar-neutral sizing converts futures notional into ETF shares
+using both prices and multipliers, preserving fractional hedge units until
+the final integer fill.
+
+When enabled, carry uses a causal one-session-lagged ^IRX 13-week T-bill
+discount-yield approximation and trailing per-share ETF dividends by ex-date:
+`fair future = spot * exp((r-q)*tau)`, with ACT/365 time to the next quarterly
+expiry. ETF fills use one tick of slippage plus a half-tick spread (1.5 cents)
+and a $0.005/share commission. Fallback constants are 4% risk-free, 1.2% SPY
+dividends, and 0.6% QQQ dividends when Yahoo rate or dividend data cannot be
+fetched.
+
+```bash
+ifsa diagnose-yahoo --config configs/sim_yahoo_es_spy_daily_refined.toml \
+  --out data/results/diag_es_spy_daily
+ifsa simulate-yahoo --config configs/sim_yahoo_es_spy_daily_refined.toml \
+  --out data/results
+ifsa compare --runs data/results/<run1> data/results/<run2> \
+  --out data/results/compare_etf.md
+```
+
+Limitations include Yahoo ES=F being an unadjusted continuous front-month
+series; SPY daily closes at 16:00 ET versus the ES=F daily settlement label;
+the ^IRX discount-yield approximation; dividends applied by ex-date; roughly
+60-day 5-minute retention; no ETF borrow or financing cost; and no margin
+modelling.
+
 ## Project layout
 
 ```text

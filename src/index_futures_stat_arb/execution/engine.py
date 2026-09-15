@@ -1,4 +1,4 @@
-"""Incremental, no-lookahead ES/NQ simulation engine."""
+"""Incremental, no-lookahead two-leg pair simulation engine."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ class SimulationConfig:
     min_hedge_sessions: int = 5
     mask_roll_sessions: bool = True
     z_reset_each_session: bool = True
+    carry_adjust: bool = False
     recompute_z_window_on_refit: bool = True
     hedge_method: HedgeMethod = "ols"
     kalman_delta: float = 1e-5
@@ -179,7 +180,7 @@ def load_pair_bars(
         contracts = list_contracts(product, start, end)
         contracts_by_product[product] = contracts
         calendars[product] = build_roll_calendar(product, daily, contracts, cfg.roll, start, end)
-    joint = joint_roll_calendar(calendars["ES"], calendars["NQ"])
+    joint = joint_roll_calendar(calendars[cfg.products[0]], calendars[cfg.products[1]])
     frames = []
     for product in cfg.products:
         calendars[product] = joint[product]
@@ -201,27 +202,29 @@ def load_pair_bars(
         adjusted["roll_flag"] = adjusted["session_date"].isin(roll_sessions)
         adjusted = _resample(adjusted, cfg.bar_minutes, cfg.rth_only, product)
         unadjusted = _resample(unadjusted, cfg.bar_minutes, cfg.rth_only, product)
-        adjusted[f"{product.lower()}_close_raw"] = unadjusted["close"].to_numpy()
+        adjusted["close_raw"] = unadjusted["close"].to_numpy()
         frames.append(adjusted)
-    es, nq = frames
-    result = es.merge(nq, on="ts_event", suffixes=("_es", "_nq"))
-    result["session_date"] = result["session_date_es"]
+    a, b = frames
+    result = a.merge(b, on="ts_event", suffixes=("_a", "_b"))
+    result["session_date"] = result["session_date_a"]
     result = result.rename(
         columns={
-            "open_es": "es_open",
-            "high_es": "es_high",
-            "low_es": "es_low",
-            "close_es": "es_close",
-            "volume_es": "es_volume",
-            "contract_es": "es_contract",
-            "roll_flag_es": "es_roll",
-            "open_nq": "nq_open",
-            "high_nq": "nq_high",
-            "low_nq": "nq_low",
-            "close_nq": "nq_close",
-            "volume_nq": "nq_volume",
-            "contract_nq": "nq_contract",
-            "roll_flag_nq": "nq_roll",
+            "open_a": "a_open",
+            "high_a": "a_high",
+            "low_a": "a_low",
+            "close_a": "a_close",
+            "volume_a": "a_volume",
+            "contract_a": "a_contract",
+            "roll_flag_a": "a_roll",
+            "close_raw_a": "a_close_raw",
+            "open_b": "b_open",
+            "high_b": "b_high",
+            "low_b": "b_low",
+            "close_b": "b_close",
+            "volume_b": "b_volume",
+            "contract_b": "b_contract",
+            "roll_flag_b": "b_roll",
+            "close_raw_b": "b_close_raw",
         }
     )
     return (
@@ -229,22 +232,22 @@ def load_pair_bars(
             [
                 "ts_event",
                 "session_date",
-                "es_open",
-                "es_high",
-                "es_low",
-                "es_close",
-                "es_volume",
-                "nq_open",
-                "nq_high",
-                "nq_low",
-                "nq_close",
-                "nq_volume",
-                "es_contract",
-                "nq_contract",
-                "es_roll",
-                "nq_roll",
-                "es_close_raw",
-                "nq_close_raw",
+                "a_open",
+                "a_high",
+                "a_low",
+                "a_close",
+                "a_volume",
+                "b_open",
+                "b_high",
+                "b_low",
+                "b_close",
+                "b_volume",
+                "a_contract",
+                "b_contract",
+                "a_roll",
+                "b_roll",
+                "a_close_raw",
+                "b_close_raw",
             ]
         ]
         .sort_values("ts_event")
@@ -290,6 +293,29 @@ def run_simulation(
     of the roll session at that bar's open.
     """
     bars = bars.sort_values("ts_event").reset_index(drop=True)
+    if "a_close" not in bars.columns and "es_close" in bars.columns:
+        bars = bars.rename(
+            columns={
+                "es_open": "a_open",
+                "es_high": "a_high",
+                "es_low": "a_low",
+                "es_close": "a_close",
+                "es_volume": "a_volume",
+                "nq_open": "b_open",
+                "nq_high": "b_high",
+                "nq_low": "b_low",
+                "nq_close": "b_close",
+                "nq_volume": "b_volume",
+                "es_contract": "a_contract",
+                "nq_contract": "b_contract",
+                "es_roll": "a_roll",
+                "nq_roll": "b_roll",
+                "es_close_raw": "a_close_raw",
+                "nq_close_raw": "b_close_raw",
+            }
+        )
+    if "carry" not in bars.columns:
+        bars["carry"] = 0.0
     if bars.empty:
         empty = pd.Series(dtype=float)
         return SimulationResult(
@@ -304,7 +330,9 @@ def run_simulation(
             pd.DataFrame(),
         )
     cursor = _BarCursor(bars)
-    sizer: Sizer = build_sizer(cfg.sizer)
+    spec_a = PRODUCTS[cfg.products[0]]
+    spec_b = PRODUCTS[cfg.products[1]]
+    sizer: Sizer = build_sizer(cfg.sizer, spec_a, spec_b)
     state = SizerState()
     signal_state = SignalState(cfg.entry, cfg.exit, cfg.stop)
     positions: list[dict[str, object]] = []
@@ -313,14 +341,15 @@ def run_simulation(
     trades: list[dict[str, object]] = []
     hedge_rows: list[dict[str, object]] = []
     pending: dict[int, tuple[int, int, str]] = {}
-    held_es = held_nq = 0
-    previous_es = previous_nq = 0.0
+    held_a = held_b = 0
+    previous_a = previous_b = 0.0
     previous_beta = float("nan")
     alpha = beta = float("nan")
     kalman: KalmanHedge | None = None
     session_spreads: list[float] = []
-    log_es_history: list[float] = []
-    log_nq_history: list[float] = []
+    log_a_history: list[float] = []
+    log_b_history: list[float] = []
+    carry_history: list[float] = []
     session_history: list[date] = []
     sessions = bars["session_date"].drop_duplicates().tolist()
     unit_session_pnl = 0.0
@@ -336,12 +365,13 @@ def run_simulation(
                 if history_session == current_session
             ]
         else:
-            indices = list(range(len(log_es_history)))
+            indices = list(range(len(log_a_history)))
         if not indices:
             return np.empty(0, dtype=float)
-        es_values = np.asarray([log_es_history[index] for index in indices], dtype=float)
-        nq_values = np.asarray([log_nq_history[index] for index in indices], dtype=float)
-        residuals = es_values - state_alpha - state_beta * nq_values
+        a_values = np.asarray([log_a_history[index] for index in indices], dtype=float)
+        b_values = np.asarray([log_b_history[index] for index in indices], dtype=float)
+        carry_values = np.asarray([carry_history[index] for index in indices], dtype=float)
+        residuals = a_values - carry_values - state_alpha - state_beta * b_values
         return residuals[-cfg.z_window :]
 
     def sample_z(window: np.ndarray, current_spread: float) -> float:
@@ -369,8 +399,10 @@ def run_simulation(
             history = bars[bars["session_date"].isin(prior_sessions)]
             session_gate_reason = None
             if len(prior_sessions) >= cfg.min_hedge_sessions and len(history) >= 2:
-                x = np.log(history["nq_close"].to_numpy())
-                y = np.log(history["es_close"].to_numpy())
+                x = np.log(history["b_close"].to_numpy())
+                y = np.log(history["a_close"].to_numpy())
+                if cfg.carry_adjust and "carry" in history:
+                    y = y - history["carry"].to_numpy()
                 if cfg.hedge_method == "rolling_eg":
                     fit = rolling_engle_granger(y, x)
                     alpha, beta, pvalue = fit.alpha, fit.beta, fit.pvalue
@@ -430,29 +462,32 @@ def run_simulation(
                 alpha, beta = kalman.alpha, kalman.beta
         trade_start = len(trades)
         if i in pending:
-            target_es, target_nq, reason = pending.pop(i)
-            held_es, held_nq = _execute_target(
-                row, held_es, held_nq, target_es, target_nq, reason, cfg, trades
+            target_a, target_b, reason = pending.pop(i)
+            held_a, held_b = _execute_target(
+                row, held_a, held_b, target_a, target_b, reason, cfg, trades
             )
-        if bool(row.get("es_roll", False)) or bool(row.get("nq_roll", False)):
+        if bool(row.get("a_roll", False)) or bool(row.get("b_roll", False)):
             if i == 0 or session != bars.iloc[i - 1]["session_date"]:
                 previous_row = None if i == 0 else bars.iloc[i - 1]
-                if held_es and (
-                    previous_row is None or row["es_contract"] != previous_row["es_contract"]
+                if held_a and (
+                    previous_row is None or row["a_contract"] != previous_row["a_contract"]
                 ):
-                    _record_roll(row, previous_row, "ES", held_es, cfg, trades)
-                if held_nq and (
-                    previous_row is None or row["nq_contract"] != previous_row["nq_contract"]
+                    _record_roll(row, previous_row, cfg.products[0], held_a, cfg, trades)
+                if held_b and (
+                    previous_row is None or row["b_contract"] != previous_row["b_contract"]
                 ):
-                    _record_roll(row, previous_row, "NQ", held_nq, cfg, trades)
+                    _record_roll(row, previous_row, cfg.products[1], held_b, cfg, trades)
         current_pnl = _mark_pnl(
             row,
             i,
-            held_es,
-            held_nq,
-            previous_es,
-            previous_nq,
+            held_a,
+            held_b,
+            previous_a,
+            previous_b,
             trades[trade_start:],
+            spec_a,
+            spec_b,
+            cfg.products,
         )
         current_pnl -= sum(
             float(cast(Any, trade.get("fees_usd", 0.0))) for trade in trades[trade_start:]
@@ -461,29 +496,31 @@ def run_simulation(
         if i > 0:
             hedge_unit = (
                 previous_beta
-                * previous_es
-                * PRODUCTS["ES"].multiplier_usd
-                / (previous_nq * PRODUCTS["NQ"].multiplier_usd)
-                if np.isfinite(previous_beta) and previous_nq
+                * previous_a
+                * spec_a.multiplier_usd
+                / (previous_b * spec_b.multiplier_usd)
+                if np.isfinite(previous_beta) and previous_b
                 else 1.0
             )
-            unit_session_pnl += (float(row["es_close"]) - previous_es) * PRODUCTS[
-                "ES"
-            ].multiplier_usd - hedge_unit * (float(row["nq_close"]) - previous_nq) * PRODUCTS[
-                "NQ"
-            ].multiplier_usd
+            unit_session_pnl += (
+                float(row["a_close"]) - previous_a
+            ) * spec_a.multiplier_usd - hedge_unit * (
+                float(row["b_close"]) - previous_b
+            ) * spec_b.multiplier_usd
         previous_session = session
-        previous_es, previous_nq = float(row["es_close"]), float(row["nq_close"])
-        log_es = float(np.log(row["es_close"]))
-        log_nq = float(np.log(row["nq_close"]))
+        previous_a, previous_b = float(row["a_close"]), float(row["b_close"])
+        carry_value = float(row.get("carry", 0.0)) if cfg.carry_adjust else 0.0
+        log_a_raw = float(np.log(row["a_close"]))
+        log_a = log_a_raw - carry_value
+        log_b = float(np.log(row["b_close"]))
         if kalman is not None:
             prior_alpha, prior_beta = kalman.alpha, kalman.beta
-            kalman.predict(log_nq)
-            spread = log_es - prior_alpha - prior_beta * log_nq
+            kalman.predict(log_b)
+            spread = log_a - prior_alpha - prior_beta * log_b
             prior_window = state_window(prior_alpha, prior_beta, session)
         else:
             spread = (
-                float(log_es - alpha - beta * log_nq) if np.isfinite(alpha + beta) else float("nan")
+                float(log_a - alpha - beta * log_b) if np.isfinite(alpha + beta) else float("nan")
             )
             prior_window = np.asarray(session_spreads[-(cfg.z_window - 1) :], dtype=float)
         half_life = float("nan")
@@ -519,11 +556,12 @@ def run_simulation(
         else:
             z = sample_z(prior_window, spread)
         session_spreads.append(spread)
-        log_es_history.append(log_es)
-        log_nq_history.append(log_nq)
+        log_a_history.append(log_a_raw)
+        log_b_history.append(log_b)
+        carry_history.append(carry_value)
         session_history.append(session)
         if kalman is not None:
-            kalman.update(log_es, log_nq)
+            kalman.update(log_a, log_b)
             alpha, beta = kalman.alpha, kalman.beta
             hedge_rows.append(
                 {
@@ -542,7 +580,7 @@ def run_simulation(
             session_entry_gate
             and threshold_gate
             and not (
-                cfg.mask_roll_sessions and (bool(row.get("es_roll")) or bool(row.get("nq_roll")))
+                cfg.mask_roll_sessions and (bool(row.get("a_roll")) or bool(row.get("b_roll")))
             )
         )
         gated = not allow_entry
@@ -569,8 +607,8 @@ def run_simulation(
             sizing_beta = beta if np.isfinite(beta) else 1.0
             target = sizer.size(
                 signal,
-                float(row["es_close"]),
-                float(row["nq_close"]),
+                float(row["a_close"]),
+                float(row["b_close"]),
                 float(sizing_beta),
                 state,
             )
@@ -590,19 +628,25 @@ def run_simulation(
                 "gate_reason": gate_reason,
             }
         )
-        positions.append({"ts_event": row["ts_event"], "n_es": held_es, "n_nq": held_nq})
+        position = {"ts_event": row["ts_event"], "n_a": held_a, "n_b": held_b}
+        if cfg.products == ("ES", "NQ"):
+            position.update({"n_es": held_a, "n_nq": held_b})
+        positions.append(position)
         previous_beta = beta
-    if held_es or held_nq:
+    if held_a or held_b:
         row = bars.iloc[-1].copy()
-        row["es_open"] = row["es_close"]
-        row["nq_open"] = row["nq_close"]
+        row["a_open"] = row["a_close"]
+        row["b_open"] = row["b_close"]
         trade_start = len(trades)
-        held_es, held_nq = _execute_target(row, held_es, held_nq, 0, 0, "eod_final", cfg, trades)
+        held_a, held_b = _execute_target(row, held_a, held_b, 0, 0, "eod_final", cfg, trades)
         pnl_values[-1] -= sum(
             float(cast(Any, trade.get("fees_usd", 0.0))) for trade in trades[trade_start:]
         )
-        positions[-1]["n_es"] = held_es
-        positions[-1]["n_nq"] = held_nq
+        positions[-1]["n_a"] = held_a
+        positions[-1]["n_b"] = held_b
+        if cfg.products == ("ES", "NQ"):
+            positions[-1]["n_es"] = held_a
+            positions[-1]["n_nq"] = held_b
     pnl = pd.Series(pnl_values, index=bars["ts_event"], name="pnl")
     position_frame = pd.DataFrame(positions).set_index("ts_event")
     equity = cfg.initial_capital_usd + pnl.cumsum()
@@ -637,18 +681,18 @@ def run_simulation(
 
 def _execute_target(
     row: pd.Series,
-    old_es: int,
-    old_nq: int,
-    target_es: int,
-    target_nq: int,
+    old_a: int,
+    old_b: int,
+    target_a: int,
+    target_b: int,
     reason: str,
     cfg: SimulationConfig,
     trades: list[dict[str, object]],
     contract_overrides: dict[str, str] | None = None,
 ) -> tuple[int, int]:
-    for product, old, target, reference in (
-        ("ES", old_es, target_es, float(row["es_open"])),
-        ("NQ", old_nq, target_nq, float(row["nq_open"])),
+    for product, old, target, reference, key in (
+        (cfg.products[0], old_a, target_a, float(row["a_open"]), "a"),
+        (cfg.products[1], old_b, target_b, float(row["b_open"]), "b"),
     ):
         delta = target - old
         if not delta:
@@ -661,9 +705,7 @@ def _execute_target(
             {
                 "ts_event": row["ts_event"],
                 "product": product,
-                "contract": (contract_overrides or {}).get(
-                    product, row[f"{product.lower()}_contract"]
-                ),
+                "contract": (contract_overrides or {}).get(product, row[f"{key}_contract"]),
                 "side": side,
                 "qty": delta,
                 "fill_px": fill,
@@ -673,7 +715,7 @@ def _execute_target(
                 "reason": reason,
             }
         )
-    return target_es, target_nq
+    return target_a, target_b
 
 
 def _record_roll(
@@ -684,34 +726,37 @@ def _record_roll(
     cfg: SimulationConfig,
     trades: list[dict[str, object]],
 ) -> None:
-    key = product.lower()
+    key = "a" if product == cfg.products[0] else "b"
     old_contract = (
         row[f"{key}_contract"] if previous_row is None else previous_row[f"{key}_contract"]
     )
     new_contract = row[f"{key}_contract"]
-    if product == "ES":
-        _execute_target(row, quantity, 0, 0, 0, "roll", cfg, trades, {"ES": str(old_contract)})
-        _execute_target(row, 0, 0, quantity, 0, "roll", cfg, trades, {"ES": str(new_contract)})
+    if product == cfg.products[0]:
+        _execute_target(row, quantity, 0, 0, 0, "roll", cfg, trades, {product: str(old_contract)})
+        _execute_target(row, 0, 0, quantity, 0, "roll", cfg, trades, {product: str(new_contract)})
     else:
-        _execute_target(row, 0, quantity, 0, 0, "roll", cfg, trades, {"NQ": str(old_contract)})
-        _execute_target(row, 0, 0, 0, quantity, "roll", cfg, trades, {"NQ": str(new_contract)})
+        _execute_target(row, 0, quantity, 0, 0, "roll", cfg, trades, {product: str(old_contract)})
+        _execute_target(row, 0, 0, 0, quantity, "roll", cfg, trades, {product: str(new_contract)})
 
 
 def _mark_pnl(
     row: pd.Series,
     i: int,
-    es_qty: int,
-    nq_qty: int,
-    previous_es: float,
-    previous_nq: float,
+    a_qty: int,
+    b_qty: int,
+    previous_a: float,
+    previous_b: float,
     fills: list[dict[str, object]],
+    spec_a: Any,
+    spec_b: Any,
+    products: tuple[str, str],
 ) -> float:
     if i == 0:
         return 0.0
     total = 0.0
-    for product, quantity, previous, close in (
-        ("ES", es_qty, previous_es, float(row["es_close"])),
-        ("NQ", nq_qty, previous_nq, float(row["nq_close"])),
+    for product, quantity, previous, close, spec in (
+        (products[0], a_qty, previous_a, float(row["a_close"]), spec_a),
+        (products[1], b_qty, previous_b, float(row["b_close"]), spec_b),
     ):
         product_fills = [fill for fill in fills if fill["product"] == product]
         running_qty = quantity
@@ -722,8 +767,8 @@ def _mark_pnl(
             fill_price = float(cast(Any, fill["fill_px"]))
             delta = int(cast(Any, fill["qty"]))
             old_qty = running_qty
-            total += old_qty * PRODUCTS[product].multiplier_usd * (fill_price - running_previous)
+            total += old_qty * spec.multiplier_usd * (fill_price - running_previous)
             running_qty += delta
             running_previous = fill_price
-        total += running_qty * PRODUCTS[product].multiplier_usd * (close - running_previous)
+        total += running_qty * spec.multiplier_usd * (close - running_previous)
     return total

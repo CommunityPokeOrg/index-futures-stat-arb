@@ -47,6 +47,10 @@ class YahooConfig:
     cache_dir: Path = Path("data/yahoo")
     bar_minutes: int | None = None
     rth_only: bool = False
+    rate_symbol: str = "IRX"
+    carry_adjust: bool = False
+    fallback_risk_free_rate: float | None = None
+    fallback_dividend_yield: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cache_dir", Path(self.cache_dir))

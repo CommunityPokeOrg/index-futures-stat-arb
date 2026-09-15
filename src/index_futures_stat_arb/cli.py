@@ -9,8 +9,9 @@ import subprocess
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from .config import load_config, load_roll_config, load_simulation_config, load_yahoo_config
@@ -43,6 +44,11 @@ def main(argv: list[str] | None = None) -> int:
     simulate_yahoo.add_argument("--out", required=True, type=Path)
     simulate_yahoo.add_argument("--no-cache", action="store_true")
     simulate_yahoo.add_argument("--offline-fixture", type=Path)
+    diagnose_yahoo = subparsers.add_parser("diagnose-yahoo")
+    diagnose_yahoo.add_argument("--config", required=True, type=Path)
+    diagnose_yahoo.add_argument("--out", required=True, type=Path)
+    diagnose_yahoo.add_argument("--no-cache", action="store_true")
+    diagnose_yahoo.add_argument("--offline-fixture", type=Path)
     compare = subparsers.add_parser("compare")
     compare.add_argument("--runs", nargs="+", type=Path, required=True)
     compare.add_argument("--out", required=True, type=Path)
@@ -204,11 +210,16 @@ def main(argv: list[str] | None = None) -> int:
         for key, value in simulation_result.metrics.items():
             print(f"{key}: {value}")
         return 0
-    if args.command == "simulate-yahoo":
+    if args.command == "simulate-yahoo" or args.command == "diagnose-yahoo":
         from datetime import date
 
+        from .basis import time_to_expiry_years, trailing_dividend_yield
         from .execution.engine import run_simulation
-        from .ingest.yahoo import build_pair_bars, fetch_yahoo_bars
+        from .ingest.yahoo import (
+            build_pair_bars,
+            fetch_yahoo_bars,
+            fetch_yahoo_dividends,
+        )
 
         sim_config = load_simulation_config(args.config)
         yahoo_config = load_yahoo_config(args.config)
@@ -239,15 +250,78 @@ def main(argv: list[str] | None = None) -> int:
                     cache_dir=yahoo_config.cache_dir,
                     use_cache=not args.no_cache,
                 )
+        carry_source = "none"
+        carry_values = None
+        carry_meta: dict[str, object] = {}
+        if yahoo_config.carry_adjust:
+            try:
+                rate_frame, rate_meta = fetch_yahoo_bars(
+                    yahoo_config.rate_symbol,
+                    start,
+                    end,
+                    yahoo_config.interval,
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+                dividends, dividends_meta = fetch_yahoo_dividends(
+                    sim_config.products[1],
+                    cache_dir=yahoo_config.cache_dir,
+                    use_cache=not args.no_cache,
+                )
+                rate_daily = rate_frame.set_index("session_date")["close"].astype(float) / 100.0
+                rate_daily = rate_daily.groupby(level=0).last().shift(1)
+                spot_daily = (
+                    frames[sim_config.products[1]]
+                    .set_index("session_date")["close"]
+                    .groupby(level=0)
+                    .last()
+                )
+                div_yield = trailing_dividend_yield(dividends, spot_daily)
+                index = spot_daily.index
+                tau = pd.Series(
+                    [time_to_expiry_years(pd.Timestamp(item).date()) for item in index],
+                    index=index,
+                )
+                carry_values = (rate_daily.reindex(index).ffill().fillna(0.0) - div_yield) * tau
+                carry_source = "yahoo_irx_dividends"
+                carry_meta = {"rate": rate_meta, "dividends": dividends_meta}
+            except Exception:
+                if (
+                    yahoo_config.fallback_risk_free_rate is None
+                    or yahoo_config.fallback_dividend_yield is None
+                ):
+                    raise
+                session_index = frames[sim_config.products[1]]["session_date"].drop_duplicates()
+                tau_values = pd.Series(
+                    [time_to_expiry_years(pd.Timestamp(item).date()) for item in session_index],
+                    index=session_index,
+                    dtype=float,
+                )
+                carry_values = (
+                    yahoo_config.fallback_risk_free_rate - yahoo_config.fallback_dividend_yield
+                ) * tau_values
+                carry_source = "fallback_constant"
         pair_bars = build_pair_bars(
-            frames["ES"],
-            frames["NQ"],
+            frames[sim_config.products[0]],
+            frames[sim_config.products[1]],
             bar_minutes=yahoo_config.bar_minutes,
             rth_only=yahoo_config.rth_only,
+            carry=carry_values,
         )
+        if args.command == "diagnose-yahoo":
+            diagnostics = _yahoo_diagnostics(pair_bars, sim_config)
+            diagnostics["data_meta"] = metadata | carry_meta
+            diagnostics["carry_source"] = carry_source
+            args.out.mkdir(parents=True, exist_ok=True)
+            (args.out / "diagnostics.json").write_text(
+                json.dumps(diagnostics, default=str, indent=2)
+            )
+            (args.out / "diagnostics.md").write_text(_diagnostics_markdown(diagnostics))
+            print((args.out / "diagnostics.md").read_text(), end="")
+            return 0
         simulation_result = run_simulation(pair_bars, sim_config)
-        effective_start = metadata["ES"].get("effective_start", start.isoformat())
-        effective_end = metadata["ES"].get("effective_end", end.isoformat())
+        effective_start = metadata[sim_config.products[0]].get("effective_start", start.isoformat())
+        effective_end = metadata[sim_config.products[0]].get("effective_end", end.isoformat())
         config_json = json.dumps(asdict(sim_config), default=str, sort_keys=True)
         run_id = _run_id(config_json)
         report_path = _write_run(
@@ -256,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             simulation_result,
             {
                 "data_source": "yahoo",
-                "data_meta": metadata,
+                "data_meta": metadata | {"carry_source": carry_source},
                 "roll_calendars": {},
                 "data_manifest_id": f"yahoo:{yahoo_config.interval}:"
                 f"{effective_start}:{effective_end}",
@@ -265,9 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"report={report_path}")
         print(
             f"data_source=yahoo interval={yahoo_config.interval} "
-            f"ES rows={metadata['ES'].get('rows', len(frames['ES']))} "
-            f"NQ rows={metadata['NQ'].get('rows', len(frames['NQ']))} "
-            f"range={effective_start}..{effective_end}"
+            + " ".join(
+                f"{product} rows={metadata[product].get('rows', len(frames[product]))}"
+                for product in sim_config.products
+            )
+            + f" range={effective_start}..{effective_end}"
         )
         for key, value in simulation_result.metrics.items():
             print(f"{key}: {value}")
@@ -297,8 +373,8 @@ def _write_run(
             "ts_event": result.pnl.index,
             "pnl": result.pnl.to_numpy(),
             "equity": result.equity.to_numpy(),
-            "n_es": result.positions["n_es"].to_numpy(),
-            "n_nq": result.positions["n_nq"].to_numpy(),
+            "n_a": result.positions["n_a"].to_numpy(),
+            "n_b": result.positions["n_b"].to_numpy(),
             "z": result.signals["z"].to_numpy(),
         }
     ).to_csv(run_dir / "equity.csv", index=False)
@@ -333,6 +409,137 @@ def _run_id(config_json: str) -> str:
     )
 
 
+def _yahoo_diagnostics(bars: pd.DataFrame, config: Any) -> dict[str, object]:
+    from .cointegration import adf_test
+    from .execution.hedge import KalmanHedge
+    from .ou import fit_ou
+
+    a = np.log(bars["a_close"].astype(float))
+    b = np.log(bars["b_close"].astype(float))
+    carry = bars.get("carry", pd.Series(0.0, index=bars.index)).astype(float)
+    raw = a - b
+    adjusted = a - carry - b
+    beta, alpha = np.polyfit(b, a - carry if config.carry_adjust else a, 1)
+    residual = (a - carry if config.carry_adjust else a) - alpha - beta * b
+
+    def series_summary(values: pd.Series) -> dict[str, object]:
+        values = values.replace([np.inf, -np.inf], np.nan).dropna()
+        try:
+            adf = adf_test(values)
+            adf_pvalue = adf["pvalue"]
+        except Exception:
+            adf_pvalue = float("nan")
+        try:
+            params = fit_ou(values.to_numpy(), dt=1.0)
+            half_life = params.half_life
+            stationary_sigma = params.stationary_std
+        except Exception:
+            half_life = float("nan")
+            stationary_sigma = float("nan")
+        return {
+            "adf_pvalue": adf_pvalue,
+            "ou_half_life": half_life,
+            "ou_stationary_sigma": stationary_sigma,
+        }
+
+    full: dict[str, object] = {
+        "ols_alpha": float(alpha),
+        "ols_beta": float(beta),
+        "engle_granger_pvalue": _coint_pvalue(
+            pd.Series(a - carry if config.carry_adjust else a), pd.Series(b)
+        ),
+        "raw_log_basis": series_summary(pd.Series(raw)),
+        "carry_adjusted_log_basis": (
+            series_summary(pd.Series(adjusted)) if config.carry_adjust else None
+        ),
+        "ols_residual": series_summary(pd.Series(residual)),
+    }
+    sessions = list(bars["session_date"].drop_duplicates())
+    windows: list[dict[str, object]] = []
+    width = config.hedge_lookback_sessions
+    step = max(1, width // 2)
+    for start in range(0, max(0, len(sessions) - width + 1), step):
+        selected = bars[bars["session_date"].isin(sessions[start : start + width])]
+        sx = np.log(selected["b_close"].to_numpy())
+        sy = np.log(selected["a_close"].to_numpy())
+        if config.carry_adjust:
+            sy = sy - selected["carry"].to_numpy()
+        if len(sx) < 3:
+            continue
+        w_beta, _w_alpha = np.polyfit(sx, sy, 1)
+        w_residual = sy - _w_alpha - w_beta * sx
+        windows.append(
+            {
+                "eg_pvalue": _coint_pvalue(pd.Series(sy), pd.Series(sx)),
+                "beta": float(w_beta),
+                "half_life": series_summary(pd.Series(w_residual))["ou_half_life"],
+            }
+        )
+    pvalues = [
+        float(cast(Any, item["eg_pvalue"]))
+        for item in windows
+        if np.isfinite(float(cast(Any, item["eg_pvalue"])))
+    ]
+    betas = [float(cast(Any, item["beta"])) for item in windows]
+    half_lives = [
+        float(cast(Any, item["half_life"]))
+        for item in windows
+        if np.isfinite(float(cast(Any, item["half_life"])))
+    ]
+    kalman = KalmanHedge(delta=config.kalman_delta, obs_var=config.kalman_obs_var)
+    beta_path: list[float] = []
+    for x_value, y_value in zip(np.asarray(b), np.asarray(a - carry), strict=True):
+        kalman.predict(float(x_value))
+        kalman.update(float(y_value), float(x_value))
+        beta_path.append(kalman.beta)
+    return {
+        "rows": {"a": int(len(bars)), "b": int(len(bars))},
+        "effective_range": {
+            "start": str(bars["session_date"].min()),
+            "end": str(bars["session_date"].max()),
+        },
+        "interval": str(bars["ts_event"].diff().dropna().median()),
+        "full_sample": full,
+        "rolling": {
+            "window_sessions": width,
+            "step_sessions": step,
+            "fraction_eg_p_lt_005": float(sum(p < 0.05 for p in pvalues) / len(pvalues))
+            if pvalues
+            else 0.0,
+            "fraction_eg_p_lt_010": float(sum(p < 0.10 for p in pvalues) / len(pvalues))
+            if pvalues
+            else 0.0,
+            "beta_min": min(betas) if betas else float("nan"),
+            "beta_median": float(np.median(betas)) if betas else float("nan"),
+            "beta_max": max(betas) if betas else float("nan"),
+            "half_life_median": float(np.median(half_lives)) if half_lives else float("nan"),
+        },
+        "kalman_beta": {
+            "min": min(beta_path) if beta_path else float("nan"),
+            "median": float(np.median(beta_path)) if beta_path else float("nan"),
+            "max": max(beta_path) if beta_path else float("nan"),
+            "delta": config.kalman_delta,
+        },
+    }
+
+
+def _coint_pvalue(y: pd.Series, x: pd.Series) -> float:
+    from .cointegration import engle_granger
+
+    try:
+        return float(engle_granger(y, x).pvalue)
+    except Exception:
+        return float("nan")
+
+
+def _diagnostics_markdown(diagnostics: dict[str, object]) -> str:
+    lines = ["# Yahoo pair diagnostics", ""]
+    lines.append("```json")
+    lines.append(json.dumps(diagnostics, default=str, indent=2))
+    lines.extend(["```", ""])
+    return "\n".join(lines)
+
+
 def _comparison_table(run_dirs: list[Path]) -> str:
     headers = [
         "label",
@@ -360,11 +567,19 @@ def _comparison_table(run_dirs: list[Path]) -> str:
         config = report.get("config", {})
         metrics = report.get("metrics", {})
         metadata = report.get("data_meta", {})
-        es_meta = metadata.get("ES", {}) if isinstance(metadata, dict) else {}
-        nq_meta = metadata.get("NQ", {}) if isinstance(metadata, dict) else {}
-        start = es_meta.get("effective_start", config.get("start", ""))
-        end = es_meta.get("effective_end", config.get("end", ""))
-        bars = es_meta.get("rows", nq_meta.get("rows", ""))
+        leg_meta = (
+            [
+                value
+                for key, value in metadata.items()
+                if key not in {"carry_source", "rate", "dividends"} and isinstance(value, dict)
+            ]
+            if isinstance(metadata, dict)
+            else []
+        )
+        first_meta = leg_meta[0] if leg_meta else {}
+        start = first_meta.get("effective_start", config.get("start", ""))
+        end = first_meta.get("effective_end", config.get("end", ""))
+        bars = first_meta.get("rows", "")
         rows.append(
             [
                 run_dir.name,

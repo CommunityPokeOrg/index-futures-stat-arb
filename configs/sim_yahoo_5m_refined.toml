@@ -43,6 +43,10 @@ es_contracts = 1
 max_contracts = 50
 
 [yahoo]
+rate_symbol = "IRX"
+carry_adjust = true
+fallback_risk_free_rate = 0.04
+fallback_dividend_yield = 0.006
 interval = "5m"
 bar_minutes = 5
 rth_only = true

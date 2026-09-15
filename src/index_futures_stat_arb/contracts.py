@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 import pyarrow as pa
@@ -26,11 +27,14 @@ class ProductSpec:
     tick_value_usd: float
     exchange: str = "XCME"
     currency: str = "USD"
+    asset_class: Literal["future", "equity"] = "future"
 
 
 PRODUCTS = {
     "ES": ProductSpec("ES", 50.0, 0.25, 12.5),
     "NQ": ProductSpec("NQ", 20.0, 0.25, 5.0),
+    "SPY": ProductSpec("SPY", 1.0, 0.01, 0.01, exchange="ARCX", asset_class="equity"),
+    "QQQ": ProductSpec("QQQ", 1.0, 0.01, 0.01, exchange="ARCX", asset_class="equity"),
 }
 
 

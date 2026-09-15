@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import numpy as np
 import pandas as pd
 
-from ..contracts import PRODUCTS
+from ..contracts import PRODUCTS, ProductSpec
 
 
 @dataclass
@@ -51,7 +52,17 @@ class FixedContracts:
 @dataclass(frozen=True)
 class DollarNeutralSizer:
     es_contracts: int = 1
-    max_contracts: int = 20
+    max_units_a: int = 20
+    max_units_b: int | None = None
+    max_contracts: int | None = None
+    spec_a: ProductSpec = field(default_factory=lambda: PRODUCTS["ES"])
+    spec_b: ProductSpec = field(default_factory=lambda: PRODUCTS["NQ"])
+
+    def __post_init__(self) -> None:
+        if self.max_contracts is not None:
+            object.__setattr__(self, "max_units_a", max(self.max_units_a, abs(self.es_contracts)))
+            if self.max_units_b is None:
+                object.__setattr__(self, "max_units_b", self.max_contracts)
 
     def unit(
         self, signal: int, es_price: float, nq_price: float, beta: float
@@ -62,8 +73,8 @@ class DollarNeutralSizer:
             * abs(self.es_contracts)
             * beta
             * es_price
-            * PRODUCTS["ES"].multiplier_usd
-            / (nq_price * PRODUCTS["NQ"].multiplier_usd)
+            * self.spec_a.multiplier_usd
+            / (nq_price * self.spec_b.multiplier_usd)
         )
         return es, nq
 
@@ -74,16 +85,28 @@ class DollarNeutralSizer:
         if signal == 0:
             return 0, 0
         es, nq = self.unit(signal, es_price, nq_price, beta)
-        nq_magnitude = min(max(1, round(abs(nq))), self.max_contracts)
-        return round(es), -signal * nq_magnitude
+        nq_magnitude = max(1, round(abs(nq)))
+        if self.max_units_b is not None:
+            nq_magnitude = min(nq_magnitude, self.max_units_b)
+        es_magnitude = min(abs(round(es)), self.max_units_a)
+        es = int(np.sign(es) * es_magnitude)
+        return es, -signal * nq_magnitude
 
 
 @dataclass(frozen=True)
 class VolTargetSizer:
     target_daily_vol_usd: float
     lookback_sessions: int = 20
-    max_contracts: int = 20
+    max_units_a: int = 20
+    max_units_b: int | None = None
+    max_contracts: int | None = None
     inner: Sizer = field(default_factory=FixedContracts)
+
+    def __post_init__(self) -> None:
+        if self.max_contracts is not None:
+            object.__setattr__(self, "max_units_a", self.max_contracts)
+            if self.max_units_b is None:
+                object.__setattr__(self, "max_units_b", self.max_contracts)
 
     def unit(
         self, signal: int, es_price: float, nq_price: float, beta: float
@@ -97,8 +120,12 @@ class VolTargetSizer:
 
         def integerize(es: float, nq: float) -> tuple[int, int]:
             return (
-                max(-self.max_contracts, min(self.max_contracts, round(es))),
-                max(-self.max_contracts, min(self.max_contracts, round(nq))),
+                max(-self.max_units_a, min(self.max_units_a, round(es))),
+                (
+                    max(-self.max_units_b, min(self.max_units_b, round(nq)))
+                    if self.max_units_b is not None
+                    else round(nq)
+                ),
             )
 
         history = state.unit_pnl_daily.dropna().tail(self.lookback_sessions)
@@ -108,7 +135,10 @@ class VolTargetSizer:
         if realized <= 0 or not pd.notna(realized):
             return integerize(unit_es, unit_nq)
         scale = max(0.0, self.target_daily_vol_usd / realized)
-        scale = min(scale, self.max_contracts / max(abs(unit_es), abs(unit_nq), 1))
+        limits = [self.max_units_a / max(abs(unit_es), 1)]
+        if self.max_units_b is not None:
+            limits.append(self.max_units_b / max(abs(unit_nq), 1))
+        scale = min(scale, *limits)
         return integerize(unit_es * scale, unit_nq * scale)
 
 
@@ -118,8 +148,14 @@ class SizerSpec:
     kwargs: dict[str, object] = field(default_factory=dict)
 
 
-def build_sizer(spec: SizerSpec) -> Sizer:
+def build_sizer(
+    spec: SizerSpec,
+    spec_a: ProductSpec | None = None,
+    spec_b: ProductSpec | None = None,
+) -> Sizer:
     kwargs: dict[str, Any] = dict(spec.kwargs)
+    spec_a = spec_a or PRODUCTS["ES"]
+    spec_b = spec_b or PRODUCTS["NQ"]
     if spec.name == "fixed":
         return FixedContracts(
             n_es=int(kwargs.get("n_es", 1)),
@@ -128,20 +164,28 @@ def build_sizer(spec: SizerSpec) -> Sizer:
     if spec.name == "dollar_neutral":
         return DollarNeutralSizer(
             es_contracts=int(kwargs.get("es_contracts", 1)),
-            max_contracts=int(kwargs.get("max_contracts", 20)),
+            max_units_a=int(kwargs.get("max_units_a", kwargs.get("max_contracts", 20))),
+            max_units_b=(
+                int(kwargs["max_units_b"]) if kwargs.get("max_units_b") is not None else None
+            ),
+            spec_a=spec_a,
+            spec_b=spec_b,
         )
     if spec.name == "vol_target":
         inner = kwargs.pop("inner", FixedContracts())
         if isinstance(inner, dict):
             inner_name = str(inner.get("name", "fixed"))
             inner_kwargs = {key: value for key, value in inner.items() if key != "name"}
-            inner = build_sizer(SizerSpec(name=inner_name, kwargs=inner_kwargs))
+            inner = build_sizer(SizerSpec(name=inner_name, kwargs=inner_kwargs), spec_a, spec_b)
         if not hasattr(inner, "size"):
             raise TypeError("inner must implement Sizer")
         return VolTargetSizer(
             target_daily_vol_usd=float(kwargs["target_daily_vol_usd"]),
             lookback_sessions=int(kwargs.get("lookback_sessions", 20)),
-            max_contracts=int(kwargs.get("max_contracts", 20)),
+            max_units_a=int(kwargs.get("max_units_a", kwargs.get("max_contracts", 20))),
+            max_units_b=(
+                int(kwargs["max_units_b"]) if kwargs.get("max_units_b") is not None else None
+            ),
             inner=inner,
         )
     raise ValueError(f"unknown sizer: {spec.name}")

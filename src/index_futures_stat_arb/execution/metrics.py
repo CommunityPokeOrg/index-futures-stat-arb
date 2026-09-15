@@ -13,6 +13,8 @@ def compute_metrics(
     positions: pd.DataFrame,
     initial_capital: float,
 ) -> dict[str, float | int]:
+    if "n_a" not in positions:
+        positions = positions.rename(columns={"n_es": "n_a", "n_nq": "n_b"})
     pnl = pnl_bar.fillna(0.0)
     daily = daily_pnl.fillna(0.0)
     total = float(pnl.sum())
@@ -58,17 +60,19 @@ def compute_metrics(
         if "slippage_usd" in trades
         else 0.0,
         "turnover_contracts": float(trades["qty"].abs().sum()) if "qty" in trades else 0.0,
-        "exposure_frac": float((positions.fillna(0).abs().sum(axis=1) > 0).mean())
+        "exposure_frac": float((positions[["n_a", "n_b"]].fillna(0).abs().sum(axis=1) > 0).mean())
         if len(positions)
         else 0.0,
         "avg_holding_bars": float(
-            (positions.fillna(0).abs().sum(axis=1) > 0).sum() / len(round_trip_pnl)
+            (positions[["n_a", "n_b"]].fillna(0).abs().sum(axis=1) > 0).sum() / len(round_trip_pnl)
         )
         if round_trip_pnl
         else 0.0,
-        "max_gross_contracts": float(positions.fillna(0).abs().sum(axis=1).max())
+        "max_gross_contracts": float(positions[["n_a", "n_b"]].fillna(0).abs().sum(axis=1).max())
         if len(positions)
         else 0.0,
+        "max_gross_units_a": float(positions["n_a"].abs().max()) if len(positions) else 0.0,
+        "max_gross_units_b": float(positions["n_b"].abs().max()) if len(positions) else 0.0,
     }
 
 

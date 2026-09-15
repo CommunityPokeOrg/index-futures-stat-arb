@@ -1,4 +1,4 @@
-"""Keyless Yahoo Finance OHLCV ingestion for continuous ES/NQ futures."""
+"""Keyless Yahoo Finance ingestion for futures, ETFs, rates, and dividends."""
 
 from __future__ import annotations
 
@@ -20,7 +20,13 @@ from .databento import (
     with_retries,
 )
 
-YAHOO_SYMBOLS: dict[str, str] = {"ES": "ES=F", "NQ": "NQ=F"}
+YAHOO_SYMBOLS: dict[str, str] = {
+    "ES": "ES=F",
+    "NQ": "NQ=F",
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "IRX": "^IRX",
+}
 
 
 @dataclass(frozen=True)
@@ -290,12 +296,55 @@ def fetch_yahoo_bars(
     return frame, metadata
 
 
+def fetch_yahoo_dividends(
+    product: str,
+    *,
+    cache_dir: Path,
+    downloader: Callable[[str], pd.Series] | None = None,
+    use_cache: bool = True,
+) -> tuple[pd.Series, dict[str, Any]]:
+    """Fetch and cache Yahoo per-share dividends by ex-date."""
+    if product not in YAHOO_SYMBOLS:
+        raise ValueError(f"unsupported Yahoo product: {product!r}")
+    destination = Path(cache_dir) / "yahoo" / "dividends" / f"product={product}.parquet"
+    sidecar = destination.with_suffix(".json")
+    if use_cache and destination.exists() and sidecar.exists():
+        frame = pd.read_parquet(destination)
+        values = pd.Series(frame["dividend"].to_numpy(), index=pd.to_datetime(frame["date"]))
+        return values, json.loads(sidecar.read_text()) | {"cache_hit": True}
+    if downloader is None:
+        try:
+            import yfinance as yf
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("yfinance is required to fetch dividends") from exc
+        values = yf.Ticker(YAHOO_SYMBOLS[product]).dividends
+    else:
+        values = downloader(YAHOO_SYMBOLS[product])
+    values = pd.Series(values, dtype=float)
+    values.index = pd.to_datetime(values.index).tz_localize(None).normalize()
+    values = values[~values.index.duplicated(keep="last")].sort_index()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"date": values.index, "dividend": values.to_numpy()}).to_parquet(
+        destination, index=False
+    )
+    metadata = {
+        "symbol": YAHOO_SYMBOLS[product],
+        "product": product,
+        "rows": len(values),
+        "cache_hit": False,
+        "cache_path": str(destination),
+    }
+    sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return values, metadata
+
+
 def build_pair_bars(
-    es: pd.DataFrame,
-    nq: pd.DataFrame,
+    a: pd.DataFrame,
+    b: pd.DataFrame,
     *,
     bar_minutes: int | None = None,
     rth_only: bool = False,
+    carry: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Build the execution engine's aligned pair-bar frame from Yahoo bars."""
     from ..execution.engine import _resample
@@ -310,53 +359,84 @@ def build_pair_bars(
             out = out[out["is_rth"]]
         return out
 
-    es_frame = prepare(es, "ES")
-    nq_frame = prepare(nq, "NQ")
-    es_frame["es_close_raw"] = es_frame["close"]
-    nq_frame["nq_close_raw"] = nq_frame["close"]
-    merged = es_frame.merge(nq_frame, on="ts_event", suffixes=("_es", "_nq"))
-    merged["session_date"] = merged["session_date_es"]
-    return (
+    product_a = str(a["product"].iloc[0])
+    product_b = str(b["product"].iloc[0])
+    a_frame = prepare(a, product_a)
+    b_frame = prepare(b, product_b)
+    a_frame["a_close_raw"] = a_frame["close"]
+    b_frame["b_close_raw"] = b_frame["close"]
+    merged = a_frame.merge(b_frame, on="ts_event", suffixes=("_a", "_b"))
+    merged["session_date"] = merged["session_date_a"]
+    merged["carry"] = 0.0
+    if carry is not None:
+        carry_values = pd.Series(carry, dtype=float)
+        carry_values.index = pd.to_datetime(carry_values.index).date
+        merged["carry"] = merged["session_date"].map(carry_values).fillna(0.0)
+    result = (
         merged[
             [
                 "ts_event",
                 "session_date",
-                "open_es",
-                "high_es",
-                "low_es",
-                "close_es",
-                "volume_es",
-                "open_nq",
-                "high_nq",
-                "low_nq",
-                "close_nq",
-                "volume_nq",
-                "contract_es",
-                "contract_nq",
-                "roll_flag_es",
-                "roll_flag_nq",
-                "es_close_raw",
-                "nq_close_raw",
+                "open_a",
+                "high_a",
+                "low_a",
+                "close_a",
+                "volume_a",
+                "open_b",
+                "high_b",
+                "low_b",
+                "close_b",
+                "volume_b",
+                "contract_a",
+                "contract_b",
+                "roll_flag_a",
+                "roll_flag_b",
+                "a_close_raw",
+                "b_close_raw",
+                "carry",
             ]
         ]
         .rename(
             columns={
-                "open_es": "es_open",
-                "high_es": "es_high",
-                "low_es": "es_low",
-                "close_es": "es_close",
-                "volume_es": "es_volume",
-                "contract_es": "es_contract",
-                "roll_flag_es": "es_roll",
-                "open_nq": "nq_open",
-                "high_nq": "nq_high",
-                "low_nq": "nq_low",
-                "close_nq": "nq_close",
-                "volume_nq": "nq_volume",
-                "contract_nq": "nq_contract",
-                "roll_flag_nq": "nq_roll",
+                "open_a": "a_open",
+                "high_a": "a_high",
+                "low_a": "a_low",
+                "close_a": "a_close",
+                "volume_a": "a_volume",
+                "contract_a": "a_contract",
+                "roll_flag_a": "a_roll",
+                "open_b": "b_open",
+                "high_b": "b_high",
+                "low_b": "b_low",
+                "close_b": "b_close",
+                "volume_b": "b_volume",
+                "contract_b": "b_contract",
+                "roll_flag_b": "b_roll",
             }
         )
         .sort_values("ts_event")
         .reset_index(drop=True)
     )
+    if (product_a, product_b) == ("ES", "NQ"):
+        result = result.rename(
+            columns={
+                "a_open": "es_open",
+                "a_high": "es_high",
+                "a_low": "es_low",
+                "a_close": "es_close",
+                "a_volume": "es_volume",
+                "b_open": "nq_open",
+                "b_high": "nq_high",
+                "b_low": "nq_low",
+                "b_close": "nq_close",
+                "b_volume": "nq_volume",
+                "a_contract": "es_contract",
+                "b_contract": "nq_contract",
+                "a_roll": "es_roll",
+                "b_roll": "nq_roll",
+                "a_close_raw": "es_close_raw",
+                "b_close_raw": "nq_close_raw",
+            }
+        )
+        return result.drop(columns=["carry"])
+    return result

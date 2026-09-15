@@ -1,18 +1,50 @@
 {
+  "base": {
+    "oos": {
+      "fees_slippage": 151.8601171874999,
+      "max_dd_pct": 0.08100600000000559,
+      "max_dd_usd": 810.0600000000559,
+      "pnl": 552.5100000000002,
+      "round_trips": 2.0,
+      "sessions": 24.0,
+      "sharpe": 1.1084512402031117,
+      "turnover": 224.874799695,
+      "win_rate": 0.5
+    },
+    "trial_id": 0
+  },
+  "base_oos": {
+    "fees_slippage": 151.8601171874999,
+    "max_dd_pct": 0.08100600000000559,
+    "max_dd_usd": 810.0600000000559,
+    "pnl": 552.5100000000002,
+    "round_trips": 2.0,
+    "sessions": 24.0,
+    "sharpe": 1.1084512402031117,
+    "turnover": 224.874799695,
+    "win_rate": 0.5
+  },
   "base_trial": 0,
-  "best_in_sample_oos_sharpe": 0.0,
+  "best_in_sample": {
+    "in_sample_sharpe": 3.002190906558958,
+    "oos_sharpe": 1.1084512402031117,
+    "trial_id": 0
+  },
+  "best_in_sample_oos_sharpe": 1.1084512402031117,
+  "best_in_sample_sharpe": 3.002190906558958,
   "best_in_sample_trial": 0,
-  "recommended_fold_sharpes": [
-    -5.612486080160913,
-    5.612486080160912,
-    0.0
-  ],
-  "recommended_model": {
-    "fold_sharpes": [
-      -5.612486080160913,
-      5.612486080160912,
-      0.0
-    ],
+  "recommended": {
+    "oos_over_test_span": {
+      "fees_slippage": 151.8601171874999,
+      "max_dd_pct": 0.08100600000000559,
+      "max_dd_usd": 810.0600000000559,
+      "pnl": 552.5100000000002,
+      "round_trips": 2.0,
+      "sessions": 24.0,
+      "sharpe": 1.1084512402031117,
+      "turnover": 224.874799695,
+      "win_rate": 0.5
+    },
     "params": {
       "coint_pvalue_gate": 0.1,
       "entry": 2.0,
@@ -28,6 +60,55 @@
     },
     "rank_stability": 2,
     "trial_id": 0
+  },
+  "recommended_fold_sharpes": [
+    -5.612486080160913,
+    5.612486080160912,
+    0.0
+  ],
+  "recommended_model": {
+    "fold_sharpes": [
+      -5.612486080160913,
+      5.612486080160912,
+      0.0
+    ],
+    "oos_over_test_span": {
+      "fees_slippage": 151.8601171874999,
+      "max_dd_pct": 0.08100600000000559,
+      "max_dd_usd": 810.0600000000559,
+      "pnl": 552.5100000000002,
+      "round_trips": 2.0,
+      "sessions": 24.0,
+      "sharpe": 1.1084512402031117,
+      "turnover": 224.874799695,
+      "win_rate": 0.5
+    },
+    "params": {
+      "coint_pvalue_gate": 0.1,
+      "entry": 2.0,
+      "exit_ratio": 0.25,
+      "half_life_max_bars": 78.0,
+      "half_life_min_bars": 1.0,
+      "kalman_delta": 1e-05,
+      "kalman_obs_var": 1e-06,
+      "max_holding_half_lives": 2.0,
+      "min_edge_cost_multiple": null,
+      "ofi_threshold": null,
+      "stop_ratio": 2.0
+    },
+    "rank_stability": 2,
+    "trial_id": 0
+  },
+  "recommended_oos": {
+    "fees_slippage": 151.8601171874999,
+    "max_dd_pct": 0.08100600000000559,
+    "max_dd_usd": 810.0600000000559,
+    "pnl": 552.5100000000002,
+    "round_trips": 2.0,
+    "sessions": 24.0,
+    "sharpe": 1.1084512402031117,
+    "turnover": 224.874799695,
+    "win_rate": 0.5
   },
   "recommended_params": {
     "coint_pvalue_gate": 0.1,
@@ -60,11 +141,14 @@
     }
   ],
   "stitched_oos": {
-    "bars": 24.0,
     "fees_slippage": 151.8601171874999,
-    "max_dd": 810.0600000000559,
+    "max_dd_pct": 0.08100600000000559,
+    "max_dd_usd": 810.0600000000559,
+    "pnl": 552.5100000000002,
+    "round_trips": 2.0,
+    "sessions": 24.0,
     "sharpe": 1.1084512402031117,
     "turnover": 224.874799695,
-    "win_rate": 0.041666666666666664
+    "win_rate": 0.5
   }
 }

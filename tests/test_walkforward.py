@@ -1,9 +1,17 @@
 from datetime import date, timedelta
 
-from index_futures_stat_arb.execution.engine import bar_derived_ofi_proxy
+import pandas as pd
+
+from index_futures_stat_arb.execution.engine import (
+    SimulationConfig,
+    SimulationResult,
+    bar_derived_ofi_proxy,
+)
 from index_futures_stat_arb.walkforward import (
+    Fold,
     SearchSpace,
     WalkForwardConfig,
+    _fold_metric,
     make_folds,
     sample_trials,
 )
@@ -40,3 +48,34 @@ def test_bar_derived_ofi_proxy_is_causal_and_zero_volume_is_neutral() -> None:
     assert before == 1 / 3
     assert after == 1 / 2
     assert bar_derived_ofi_proxy([1.0], [0.0], [0.0], 20) == 0.0
+
+
+def test_fold_win_rate_uses_closed_round_trip_pnl() -> None:
+    dates = pd.date_range("2020-01-01", periods=5, tz="UTC")
+    positions = pd.DataFrame(
+        {"n_a": [1, 1, 0, 1, 0], "n_b": [1, 1, 0, 1, 0]},
+        index=dates,
+    )
+    pnl = pd.Series([0.0, 10.0, 0.0, -5.0, 0.0], index=dates)
+    daily_pnl = pd.Series([10.0, -5.0], index=[date(2020, 1, 3), date(2020, 1, 5)])
+    config = SimulationConfig(
+        products=("ES", "NQ"),
+        start="2020-01-01",
+        end="2020-01-05",
+        initial_capital_usd=1000.0,
+    )
+    result = SimulationResult(
+        positions=positions,
+        pnl=pnl,
+        equity=1000.0 + pnl.cumsum(),
+        trades=pd.DataFrame(),
+        daily_pnl=daily_pnl,
+        metrics={},
+        config=config,
+        hedge_history=pd.DataFrame(),
+        signals=pd.DataFrame(),
+    )
+    fold = Fold(0, (date(2020, 1, 1),), (date(2020, 1, 3), date(2020, 1, 5)))
+    metrics = _fold_metric(result, config, fold)
+    assert metrics["round_trips"] == 2
+    assert metrics["win_rate"] == 0.5

@@ -247,13 +247,7 @@ def _fold_metric(
         fold_trades = trades.loc[trade_mask]
     else:
         fold_trades = trades.iloc[0:0]
-    positions = result.positions
-    position_dates = pd.Index(list(pd.to_datetime(positions.index, utc=True).date))
-    position_mask = position_dates.isin(list(fold.test_sessions))
-    active = positions.loc[position_mask].fillna(0)[["n_a", "n_b"]].abs().sum(axis=1) > 0
-    round_trips = 0
-    if len(active):
-        round_trips = int((active & ~active.shift(1, fill_value=False)).sum())
+    round_trip_pnl = _round_trip_pnl(result, fold.test_sessions)
     years = max(len(fold.test_sessions) / 252.0, 1.0 / 252.0)
     turnover_notional = 0.0
     if len(fold_trades) and {"qty", "fill_px", "product"} <= set(fold_trades.columns):
@@ -267,9 +261,19 @@ def _fold_metric(
         )
     return {
         "sharpe": sharpe,
-        "max_dd": float(-drawdown.min()) if len(drawdown) else 0.0,
-        "win_rate": float((pnl > 0).mean()) if len(pnl) else 0.0,
-        "round_trips": round_trips,
+        "pnl": float(pnl.sum()),
+        "max_dd_usd": float(-drawdown.min()) if len(drawdown) else 0.0,
+        "max_dd_pct": (
+            float(-drawdown.min()) / cfg.initial_capital_usd * 100
+            if len(drawdown) and cfg.initial_capital_usd
+            else 0.0
+        ),
+        "win_rate": (
+            sum(value > 0 for value in round_trip_pnl) / len(round_trip_pnl)
+            if round_trip_pnl
+            else 0.0
+        ),
+        "round_trips": len(round_trip_pnl),
         "trades": int(len(fold_trades)),
         "turnover": turnover_notional / cfg.initial_capital_usd / years,
         "fees_slippage": float(
@@ -277,6 +281,23 @@ def _fold_metric(
             + fold_trades.get("slippage_usd", pd.Series(dtype=float)).sum()
         ),
     }
+
+
+def _round_trip_pnl(result: SimulationResult, sessions: Sequence[date]) -> list[float]:
+    positions = result.positions.fillna(0)
+    active = positions[["n_a", "n_b"]].abs().sum(axis=1) > 0
+    dates = pd.to_datetime(positions.index, utc=True).date
+    values: list[float] = []
+    start: int | None = None
+    for index, is_active in enumerate(active.to_numpy()):
+        if is_active and start is None:
+            start = index
+        elif not is_active and start is not None:
+            close_date = dates[index]
+            if close_date in sessions:
+                values.append(float(result.pnl.iloc[start:index].sum()))
+            start = None
+    return values
 
 
 def evaluate_trials(
@@ -328,50 +349,54 @@ def select(result: WalkForwardResult, fold_index: int) -> int:
     return min(candidates, key=lambda value: (-value[0], value[1]))[1] if candidates else 0
 
 
-def _stitched_metrics(result: WalkForwardResult) -> dict[str, float]:
+def _oos_metrics(
+    result: WalkForwardResult,
+    trial_ids: Sequence[int],
+) -> dict[str, float]:
     pieces: list[pd.Series] = []
     turnover = 0.0
     fees_slippage = 0.0
-    for fold in result.folds:
-        trial_id = select(result, fold.index)
+    round_trip_pnl: list[float] = []
+    for fold, trial_id in zip(result.folds, trial_ids, strict=True):
         daily = result.simulations[trial_id].daily_pnl
         sessions = fold.test_sessions
         pieces.append(daily.loc[_session_mask(daily.index, sessions)])
         turnover += float(result.fold_metrics[trial_id][fold.index]["turnover"])
         fees_slippage += float(result.fold_metrics[trial_id][fold.index]["fees_slippage"])
+        round_trip_pnl.extend(_round_trip_pnl(result.simulations[trial_id], sessions))
     pnl = pd.concat(pieces) if pieces else pd.Series(dtype=float)
     sharpe = (
         float(pnl.mean() / pnl.std(ddof=1) * np.sqrt(252)) if len(pnl) > 1 and pnl.std() else 0.0
     )
     equity = result.base.initial_capital_usd + pnl.cumsum()
+    max_dd_usd = float(-(equity - equity.cummax()).min()) if len(equity) else 0.0
     return {
         "sharpe": sharpe,
-        "max_dd": float(-(equity - equity.cummax()).min()) if len(equity) else 0.0,
-        "win_rate": float((pnl > 0).mean()) if len(pnl) else 0.0,
-        "bars": float(len(pnl)),
+        "pnl": float(pnl.sum()),
+        "max_dd_usd": max_dd_usd,
+        "max_dd_pct": (
+            max_dd_usd / result.base.initial_capital_usd * 100
+            if result.base.initial_capital_usd
+            else 0.0
+        ),
+        "win_rate": (
+            sum(value > 0 for value in round_trip_pnl) / len(round_trip_pnl)
+            if round_trip_pnl
+            else 0.0
+        ),
+        "round_trips": float(len(round_trip_pnl)),
+        "sessions": float(len(pnl)),
         "turnover": turnover,
         "fees_slippage": fees_slippage,
     }
 
 
+def _stitched_metrics(result: WalkForwardResult) -> dict[str, float]:
+    return _oos_metrics(result, [select(result, fold.index) for fold in result.folds])
+
+
 def _base_oos_metrics(result: WalkForwardResult) -> dict[str, float]:
-    pieces = [
-        result.simulations[0].daily_pnl.loc[
-            _session_mask(result.simulations[0].daily_pnl.index, fold.test_sessions)
-        ]
-        for fold in result.folds
-    ]
-    pnl = pd.concat(pieces) if pieces else pd.Series(dtype=float)
-    sharpe = (
-        float(pnl.mean() / pnl.std(ddof=1) * np.sqrt(252)) if len(pnl) > 1 and pnl.std() else 0.0
-    )
-    equity = result.base.initial_capital_usd + pnl.cumsum()
-    return {
-        "sharpe": sharpe,
-        "max_dd": float(-(equity - equity.cummax()).min()) if len(equity) else 0.0,
-        "win_rate": float((pnl > 0).mean()) if len(pnl) else 0.0,
-        "bars": float(len(pnl)),
-    }
+    return _oos_metrics(result, [0 for _ in result.folds])
 
 
 def summarize(result: WalkForwardResult) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
@@ -412,14 +437,20 @@ def summarize(result: WalkForwardResult) -> tuple[pd.DataFrame, pd.DataFrame, di
         ranks.append(ordered.index(recommended) < max(1, int(np.ceil(len(ordered) / 4))))
     best_index = int(cast(Any, trial_frame["in_sample_sharpe"].astype(float).idxmax()))
     best_is = int(cast(Any, trial_frame.iloc[best_index]["trial_id"]))
+    stitched = _stitched_metrics(result)
+    base_oos = _base_oos_metrics(result)
+    best_is_sharpe = float(cast(Any, trial_frame.loc[best_is, "in_sample_sharpe"]))
+    best_is_oos = _oos_metrics(result, [best_is for _ in result.folds])
+    recommended_oos = _oos_metrics(result, [recommended for _ in result.folds])
     summary = {
-        "stitched_oos": _stitched_metrics(result),
+        "stitched_oos": stitched,
+        "base_oos": base_oos,
+        "recommended_oos": recommended_oos,
         "recommended_trial": recommended,
         "recommended_rank_stability": int(sum(ranks)),
         "best_in_sample_trial": best_is,
-        "best_in_sample_oos_sharpe": float(
-            cast(Any, trial_frame.loc[best_is, "median_oos_sharpe"])
-        ),
+        "best_in_sample_sharpe": best_is_sharpe,
+        "best_in_sample_oos_sharpe": best_is_oos["sharpe"],
         "base_trial": 0,
     }
     return trial_frame, fold_frame, summary
@@ -435,6 +466,116 @@ def _markdown_table(frame: pd.DataFrame) -> str:
         values = [f"{value:.10f}" if isinstance(value, float) else str(value) for value in row]
         lines.append("| " + " | ".join(values) + " |")
     return "\n".join(lines)
+
+
+def _fmt(value: Any, kind: str) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "—"
+    number = float(value)
+    if kind == "dollar":
+        return f"${number:,.0f}"
+    if kind == "pct":
+        return f"{number:.2f}%"
+    if kind == "sharpe":
+        return f"{number:.2f}"
+    if kind == "param":
+        return f"{number:.3g}"
+    if kind == "integer":
+        return f"{int(number)}"
+    return f"{number:.2f}"
+
+
+def _fold_summary_frame(result: WalkForwardResult) -> pd.DataFrame:
+    rows = []
+    for fold in result.folds:
+        trial_id = select(result, fold.index)
+        metric = result.fold_metrics[trial_id][fold.index]
+        rows.append(
+            {
+                "fold": str(fold.index),
+                "train range": f"{fold.train_sessions[0]}–{fold.train_sessions[-1]}",
+                "test range": f"{fold.test_start}–{fold.test_end}",
+                "sessions": _fmt(len(fold.test_sessions), "integer"),
+                "selected trial": str(trial_id),
+                "Sharpe": _fmt(metric["sharpe"], "sharpe"),
+                "MaxDD%": _fmt(metric["max_dd_pct"], "pct"),
+                "win": _fmt(metric["win_rate"] * 100, "pct"),
+                "round trips": _fmt(metric["round_trips"], "integer"),
+                "turnover": _fmt(metric["turnover"], "number"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _top_summary_frame(
+    result: WalkForwardResult,
+    trial_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    parameter_columns = [
+        ("kalman_delta", "kalman_delta"),
+        ("kalman_obs_var", "kalman_obs_var"),
+        ("entry", "entry"),
+        ("exit_ratio", "exit_ratio"),
+        ("stop_ratio", "stop_ratio"),
+        ("half_life_min_bars", "hl_min"),
+        ("half_life_max_bars", "hl_max"),
+        ("max_holding_half_lives", "max_hold_hl"),
+        ("min_edge_cost_multiple", "min_edge_mult"),
+        ("ofi_threshold", "ofi_thr"),
+        ("coint_pvalue_gate", "coint_gate"),
+    ]
+    top = trial_frame.nlargest(10, "median_oos_sharpe")
+    for _, trial in top.iterrows():
+        trial_id = int(trial["trial_id"])
+        oos = _oos_metrics(result, [trial_id for _ in result.folds])
+        row: dict[str, str] = {"trial_id": str(trial_id)}
+        for source, label in parameter_columns:
+            row[label] = _fmt(trial.get(source), "param")
+        row["in_sample_sharpe"] = _fmt(trial["in_sample_sharpe"], "sharpe")
+        for fold in result.folds:
+            row[f"fold_{fold.index}_sharpe"] = _fmt(
+                result.fold_metrics[trial_id][fold.index]["sharpe"], "sharpe"
+            )
+        row["median_oos"] = _fmt(trial["median_oos_sharpe"], "sharpe")
+        row["min_oos"] = _fmt(trial["min_oos_sharpe"], "sharpe")
+        row["total OOS round trips"] = _fmt(oos["round_trips"], "integer")
+        row["OOS win rate"] = _fmt(oos["win_rate"] * 100, "pct")
+        row["OOS MaxDD%"] = _fmt(oos["max_dd_pct"], "pct")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _comparison_frame(result: WalkForwardResult, summary: dict[str, Any]) -> pd.DataFrame:
+    best_id = int(summary["best_in_sample_trial"])
+    rows = [
+        ("stitched OOS", None, None, summary["stitched_oos"]),
+        ("base config", 0, None, summary["base_oos"]),
+        ("recommended model", int(summary["recommended_trial"]), None, summary["recommended_oos"]),
+        (
+            "best in-sample",
+            best_id,
+            summary["best_in_sample_sharpe"],
+            _oos_metrics(result, [best_id for _ in result.folds]),
+        ),
+    ]
+    output = []
+    for model, trial_id, in_sample, metric in rows:
+        output.append(
+            {
+                "model": model,
+                "trial_id": "—" if trial_id is None else str(trial_id),
+                "in-sample Sharpe": ("—" if in_sample is None else _fmt(in_sample, "sharpe")),
+                "Sharpe": _fmt(metric["sharpe"], "sharpe"),
+                "PnL": _fmt(metric["pnl"], "dollar"),
+                "MaxDD%": _fmt(metric["max_dd_pct"], "pct"),
+                "win": _fmt(metric["win_rate"] * 100, "pct"),
+                "round trips": _fmt(metric["round_trips"], "integer"),
+                "turnover": _fmt(metric["turnover"], "number"),
+                "fees+slippage": _fmt(metric["fees_slippage"], "dollar"),
+            }
+        )
+    return pd.DataFrame(output)
 
 
 def write_artifacts(result: WalkForwardResult, out: Path) -> dict[str, Any]:
@@ -455,9 +596,22 @@ def write_artifacts(result: WalkForwardResult, out: Path) -> dict[str, Any]:
         ),
         **summary,
         "selected_trials": selected_trials,
+        "base": {"trial_id": 0, "oos": summary["base_oos"]},
+        "recommended": {
+            "trial_id": recommended_trial,
+            "params": _model_params(result.trials[recommended_trial]),
+            "oos_over_test_span": summary["recommended_oos"],
+            "rank_stability": summary["recommended_rank_stability"],
+        },
+        "best_in_sample": {
+            "trial_id": summary["best_in_sample_trial"],
+            "in_sample_sharpe": summary["best_in_sample_sharpe"],
+            "oos_sharpe": summary["best_in_sample_oos_sharpe"],
+        },
         "recommended_model": {
             "trial_id": recommended_trial,
             "params": _model_params(result.trials[recommended_trial]),
+            "oos_over_test_span": summary["recommended_oos"],
             "fold_sharpes": [
                 result.fold_metrics[recommended_trial][i]["sharpe"]
                 for i in range(len(result.folds))
@@ -473,18 +627,15 @@ def write_artifacts(result: WalkForwardResult, out: Path) -> dict[str, Any]:
     (out / "selection.json").write_text(
         json.dumps(selection, indent=2, sort_keys=True, default=str) + "\n"
     )
-    top = trial_frame.nlargest(10, "median_oos_sharpe")
     summary_text = "# Walk-forward evaluation\n\n"
-    summary_text += "## Top 10 by median OOS Sharpe\n\n" + _markdown_table(top) + "\n\n"
-    summary_text += "## Stitched OOS vs base vs best in-sample\n\n"
-    benchmark = pd.DataFrame(
-        [
-            {"model": "stitched_oos", **summary["stitched_oos"]},
-            {"model": "base_config", **_base_oos_metrics(result)},
-            {"model": "best_in_sample", "sharpe": summary["best_in_sample_oos_sharpe"]},
-        ]
+    summary_text += "## Folds\n\n" + _markdown_table(_fold_summary_frame(result)) + "\n\n"
+    summary_text += (
+        "## Top 10 by median OOS Sharpe\n\n"
+        + _markdown_table(_top_summary_frame(result, trial_frame))
+        + "\n\n"
     )
-    summary_text += _markdown_table(benchmark) + "\n"
+    summary_text += "## Selection comparison\n\n"
+    summary_text += _markdown_table(_comparison_frame(result, summary)) + "\n"
     (out / "summary.md").write_text(summary_text)
     _plots(result, trial_frame, out)
     return selection

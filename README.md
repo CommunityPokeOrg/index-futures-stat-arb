@@ -216,6 +216,9 @@ Each output directory contains deterministic CSV/JSON/Markdown summaries and
 small PNG diagnostics, including the stitched selected-per-fold OOS equity
 curve and the base-configuration benchmark.
 
+Real-data walk-forward results, selection rule, and limitations:
+`docs/results/2026-09-15_walkforward_evaluation.md`.
+
 ## Project layout
 
 ```text

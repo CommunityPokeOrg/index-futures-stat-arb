@@ -216,9 +216,11 @@ def main(argv: list[str] | None = None) -> int:
         from .basis import time_to_expiry_years, trailing_dividend_yield
         from .execution.engine import run_simulation
         from .ingest.yahoo import (
+            YahooError,
             build_pair_bars,
             fetch_yahoo_bars,
             fetch_yahoo_dividends,
+            fetch_yahoo_rate,
         )
 
         sim_config = load_simulation_config(args.config)
@@ -255,11 +257,10 @@ def main(argv: list[str] | None = None) -> int:
         carry_meta: dict[str, object] = {}
         if yahoo_config.carry_adjust:
             try:
-                rate_frame, rate_meta = fetch_yahoo_bars(
+                rate_values, rate_meta = fetch_yahoo_rate(
                     yahoo_config.rate_symbol,
                     start,
                     end,
-                    yahoo_config.interval,
                     cache_dir=yahoo_config.cache_dir,
                     use_cache=not args.no_cache,
                 )
@@ -268,8 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                     cache_dir=yahoo_config.cache_dir,
                     use_cache=not args.no_cache,
                 )
-                rate_daily = rate_frame.set_index("session_date")["close"].astype(float) / 100.0
-                rate_daily = rate_daily.groupby(level=0).last().shift(1)
+                rate_daily = rate_values.groupby(level=0).last().shift(1)
                 spot_daily = (
                     frames[sim_config.products[1]]
                     .set_index("session_date")["close"]
@@ -285,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
                 carry_values = (rate_daily.reindex(index).ffill().fillna(0.0) - div_yield) * tau
                 carry_source = "yahoo_irx_dividends"
                 carry_meta = {"rate": rate_meta, "dividends": dividends_meta}
-            except Exception:
+            except (YahooError, OSError, ValueError) as exc:
                 if (
                     yahoo_config.fallback_risk_free_rate is None
                     or yahoo_config.fallback_dividend_yield is None
@@ -301,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
                     yahoo_config.fallback_risk_free_rate - yahoo_config.fallback_dividend_yield
                 ) * tau_values
                 carry_source = "fallback_constant"
+                carry_meta = {"fallback_reason": repr(exc)}
         pair_bars = build_pair_bars(
             frames[sim_config.products[0]],
             frames[sim_config.products[1]],
@@ -330,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             simulation_result,
             {
                 "data_source": "yahoo",
-                "data_meta": metadata | {"carry_source": carry_source},
+                "data_meta": metadata | carry_meta | {"carry_source": carry_source},
                 "roll_calendars": {},
                 "data_manifest_id": f"yahoo:{yahoo_config.interval}:"
                 f"{effective_start}:{effective_end}",

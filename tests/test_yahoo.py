@@ -17,6 +17,7 @@ from index_futures_stat_arb.ingest.yahoo import (
     build_pair_bars,
     clip_to_retention,
     fetch_yahoo_bars,
+    fetch_yahoo_rate,
     iter_request_windows,
     normalize_yahoo,
 )
@@ -169,6 +170,75 @@ def test_invalid_ohlc_is_rejected(tmp_path: Path) -> None:
             cache_dir=tmp_path,
             downloader=invalid,
         )
+
+
+def test_fetch_yahoo_rate_preserves_nonpositive_rates(tmp_path: Path) -> None:
+    def rate_downloader(symbol: str, start: date, end: date, interval: str) -> pd.DataFrame:
+        frame = _daily_frame(start, end)
+        frame["Close"] = np.linspace(0.0, -0.02, len(frame))
+        return frame
+
+    values, metadata = fetch_yahoo_rate(
+        "IRX",
+        date(2026, 1, 1),
+        date(2026, 1, 10),
+        cache_dir=tmp_path,
+        downloader=rate_downloader,
+        backoff_base_s=0,
+        backoff_max_s=0,
+    )
+    assert values.iloc[0] == 0.0
+    assert values.iloc[-1] == pytest.approx(-0.0002)
+    assert metadata["kind"] == "rate"
+    assert "kind=rate" in metadata["cache_path"]
+
+
+def test_yahoo_carry_fallback_records_reason(tmp_path: Path, monkeypatch) -> None:
+    from index_futures_stat_arb.ingest import yahoo
+
+    def fake_downloader(symbol: str, start: date, end: date, interval: str) -> pd.DataFrame:
+        return _daily_frame(start, end, 1000.0 if symbol == "SPY" else 0.0)
+
+    def failed_rate(*_: object, **__: object) -> tuple[pd.Series, dict]:
+        raise yahoo.YahooError("invalid rate cache")
+
+    monkeypatch.setattr(yahoo, "default_downloader", fake_downloader)
+    monkeypatch.setattr(yahoo, "fetch_yahoo_rate", failed_rate)
+    monkeypatch.setattr(
+        yahoo,
+        "fetch_yahoo_dividends",
+        lambda *_args, **_kwargs: (
+            pd.Series([0.1], index=pd.DatetimeIndex(["2025-01-02"])),
+            {"cache_hit": True},
+        ),
+    )
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[simulation]
+products = ["ES", "SPY"]
+start = "2025-01-01"
+end = "2026-03-01"
+bar_minutes = 1
+rth_only = false
+z_window = 20
+hedge_lookback_sessions = 10
+min_hedge_sessions = 5
+z_reset_each_session = false
+adjust = "none"
+
+[yahoo]
+interval = "1d"
+cache_dir = "CACHE"
+carry_adjust = true
+fallback_risk_free_rate = 0.04
+fallback_dividend_yield = 0.012
+""".replace("CACHE", str(tmp_path / "cache"))
+    )
+    assert main(["simulate-yahoo", "--config", str(config), "--out", str(tmp_path)]) == 0
+    report = json.loads(next(tmp_path.glob("*/report.json")).read_text())
+    assert report["data_meta"]["carry_source"] == "fallback_constant"
+    assert "invalid rate cache" in report["data_meta"]["fallback_reason"]
 
 
 def test_build_pair_bars_daily_join() -> None:

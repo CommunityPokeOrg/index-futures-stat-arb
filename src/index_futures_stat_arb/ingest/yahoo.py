@@ -296,6 +296,115 @@ def fetch_yahoo_bars(
     return frame, metadata
 
 
+def fetch_yahoo_rate(
+    symbol_key: str,
+    start: date,
+    end: date,
+    *,
+    cache_dir: Path,
+    downloader: Downloader | None = None,
+    use_cache: bool = True,
+    max_retries: int = 3,
+    backoff_base_s: float = 1.0,
+    backoff_max_s: float = 30.0,
+    sleep: Callable[[float], None] = time.sleep,
+    today: date | None = None,
+) -> tuple[pd.Series, dict[str, Any]]:
+    """Fetch a daily Yahoo rate series without applying price validation."""
+    if symbol_key not in YAHOO_SYMBOLS:
+        raise ValueError(f"unsupported Yahoo product: {symbol_key!r}")
+    interval = "1d"
+    effective_start, effective_end, clipped = clip_to_retention(
+        start, end, interval, today or datetime.now(timezone.utc).date()
+    )
+    destination = (
+        Path(cache_dir)
+        / "yahoo"
+        / f"interval={interval}"
+        / f"product={symbol_key}"
+        / "kind=rate"
+        / f"{effective_start}_{effective_end}.parquet"
+    )
+    sidecar = destination.with_suffix(".json")
+    if use_cache and destination.exists() and sidecar.exists():
+        frame = pd.read_parquet(destination)
+        values = pd.Series(
+            frame["rate"].to_numpy(dtype=float),
+            index=pd.to_datetime(frame["session_date"]).dt.date,
+        )
+        return values, json.loads(sidecar.read_text()) | {"cache_hit": True}
+
+    frames: list[pd.DataFrame] = []
+    active_downloader = downloader or default_downloader
+    for window_start, window_end in iter_request_windows(effective_start, effective_end, interval):
+
+        def fetch_window(
+            window_start: date = window_start, window_end: date = window_end
+        ) -> pd.DataFrame:
+            result = active_downloader(
+                YAHOO_SYMBOLS[symbol_key], window_start, window_end, interval
+            )
+            if result.empty:
+                raise YahooError(
+                    f"Yahoo returned no data for {symbol_key} {window_start}..{window_end}"
+                )
+            return result
+
+        try:
+            frames.append(
+                with_retries(
+                    fetch_window,
+                    max_retries,
+                    backoff_base_s,
+                    backoff_max_s,
+                    sleep=sleep,
+                    retry_on=(ConnectionError, TimeoutError, RuntimeError, YahooError),
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, YahooError):
+                raise
+            raise YahooError(f"Yahoo request failed for {symbol_key}") from exc
+
+    raw = pd.concat(frames)
+    columns = _field_columns(raw)
+    if "close" not in columns:
+        raise YahooError("Yahoo response is missing the close column")
+    index = pd.DatetimeIndex(pd.to_datetime(raw.index))
+    if index.has_duplicates:
+        raise YahooError(f"Yahoo response contains duplicate timestamps for {symbol_key}")
+    if not index.is_monotonic_increasing:
+        raise YahooError(f"Yahoo response is not sorted for {symbol_key}")
+    close = pd.to_numeric(columns["close"], errors="coerce")
+    if close.isna().any():
+        raise YahooError(f"Yahoo response contains NaN rates for {symbol_key}")
+    frame = normalize_yahoo(raw, symbol_key, interval)
+    values = frame.set_index("session_date")["close"].astype(float).groupby(level=0).last() / 100.0
+    rate_frame = pd.DataFrame({"session_date": values.index, "rate": values.to_numpy()})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    rate_frame.to_parquet(destination, index=False)
+    metadata: dict[str, Any] = {
+        "symbol": YAHOO_SYMBOLS[symbol_key],
+        "product": symbol_key,
+        "interval": interval,
+        "kind": "rate",
+        "requested_start": start.isoformat(),
+        "requested_end": end.isoformat(),
+        "effective_start": effective_start.isoformat(),
+        "effective_end": effective_end.isoformat(),
+        "clipped": clipped,
+        "rows": len(values),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "cache_hit": False,
+        "cache_path": str(destination),
+        "sha256": sha256_file(destination),
+        "rate_min": float(values.min()),
+        "rate_max": float(values.max()),
+    }
+    sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return values, metadata
+
+
 def fetch_yahoo_dividends(
     product: str,
     *,

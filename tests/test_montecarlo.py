@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
+from scipy.stats import norm
 
 from index_futures_stat_arb.execution.engine import SimulationConfig
 from index_futures_stat_arb.montecarlo import (
@@ -13,6 +16,7 @@ from index_futures_stat_arb.montecarlo import (
     bootstrap,
     circular_block_bootstrap,
     deflate,
+    probabilistic_sharpe_ratio,
     synthetic,
     write_artifacts,
 )
@@ -56,6 +60,9 @@ def test_bootstrap_is_worker_independent(tmp_path: Path) -> None:
     assert (tmp_path / "one" / "montecarlo.json").read_bytes() == (
         tmp_path / "three" / "montecarlo.json"
     ).read_bytes()
+    assert (tmp_path / "one" / "paths.csv").read_bytes() == (
+        tmp_path / "three" / "paths.csv"
+    ).read_bytes()
 
 
 def test_circular_bootstrap_preserves_contiguous_blocks() -> None:
@@ -77,7 +84,21 @@ def test_deflate_single_trial_equals_psr_against_zero() -> None:
     trials = pd.DataFrame({"median_oos_sharpe": [1.0]})
     pnl = np.arange(1.0, 21.0)
     result = deflate(trials, pnl)
-    assert result["dsr"] == result["psr_against_zero"]
+    expected = probabilistic_sharpe_ratio(
+        result["best_trial_sharpe_daily"],
+        0.0,
+        result["stitched_pnl_skew"],
+        result["stitched_pnl_kurtosis"],
+        result["stitched_sessions"],
+    )
+    assert result["best_trial_dsr"] == pytest.approx(expected)
+
+
+def test_probabilistic_sharpe_uses_daily_units() -> None:
+    daily_sharpe = 0.5 / math.sqrt(252.0)
+    expected = norm.cdf(daily_sharpe * math.sqrt(2438 - 1))
+    actual = probabilistic_sharpe_ratio(daily_sharpe, 0.0, 0.0, 3.0, 2438)
+    assert actual == pytest.approx(expected, abs=1e-3)
 
 
 def test_synthetic_path_prefix_is_causal() -> None:
@@ -106,5 +127,8 @@ def test_tiny_synthetic_run_writes_artifacts(tmp_path: Path) -> None:
     write_artifacts(result, tmp_path)
     assert (tmp_path / "montecarlo.json").exists()
     assert (tmp_path / "montecarlo.md").exists()
+    assert (tmp_path / "paths.csv").exists()
     assert (tmp_path / "sharpe_distribution.png").exists()
-    assert json.loads((tmp_path / "montecarlo.json").read_text())["n_paths"] == 3
+    summary = json.loads((tmp_path / "montecarlo.json").read_text())
+    assert summary["n_paths"] == 3
+    assert "paths" not in summary

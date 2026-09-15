@@ -313,6 +313,8 @@ def bootstrap(
             },
             "p_value_observed_sharpe": float(np.mean(null_sharpes >= observed["sharpe"])),
         },
+        "paths": paths,
+        "null_sharpe_samples": [float(value) for value in null_sharpes],
     }
 
 
@@ -448,12 +450,15 @@ def deflate(
     """Calculate PSR/DSR and minimum track record length."""
     column = "median_oos_sharpe" if "median_oos_sharpe" in trials else "in_sample_sharpe"
     trial_sharpes = trials[column].astype(float).to_numpy()
-    best = float(np.max(trial_sharpes))
+    best_annualized = float(np.max(trial_sharpes))
     n_trials = len(trial_sharpes)
-    variance = float(np.var(trial_sharpes, ddof=1)) if n_trials > 1 else 0.0
+    variance_annualized = float(np.var(trial_sharpes, ddof=1)) if n_trials > 1 else 0.0
     pnl = np.asarray(stitched_pnl, dtype=float)
     t = int(observations or len(pnl))
-    stitched_sharpe = _annualized_sharpe(pnl)
+    stitched_annualized = _annualized_sharpe(pnl)
+    best_daily = best_annualized / math.sqrt(252.0)
+    variance_daily = variance_annualized / 252.0
+    stitched_daily = stitched_annualized / math.sqrt(252.0)
     skewness = float(skew(pnl, bias=False)) if len(pnl) > 2 else 0.0
     kurtosis_value = float(kurtosis(pnl, fisher=False, bias=False)) if len(pnl) > 3 else 3.0
     if n_trials <= 1:
@@ -461,46 +466,76 @@ def deflate(
     else:
         q1 = norm.ppf(1.0 - 1.0 / n_trials)
         q2 = norm.ppf(1.0 - 1.0 / (n_trials * math.e))
-        benchmark = math.sqrt(max(variance, 0.0)) * ((1.0 - 0.5772156649) * q1 + 0.5772156649 * q2)
-    psr = probabilistic_sharpe_ratio(best, 0.0, skewness, kurtosis_value, t)
-    dsr = probabilistic_sharpe_ratio(best, benchmark, skewness, kurtosis_value, t)
+        benchmark = math.sqrt(max(variance_daily, 0.0)) * (
+            (1.0 - 0.5772156649) * q1 + 0.5772156649 * q2
+        )
+    stitched_psr = probabilistic_sharpe_ratio(stitched_daily, 0.0, skewness, kurtosis_value, t)
+    best_dsr = probabilistic_sharpe_ratio(best_daily, benchmark, skewness, kurtosis_value, t)
     z = norm.ppf(0.95)
     correction = math.sqrt(
         max(
             1e-15,
-            1.0 - skewness * stitched_sharpe + (kurtosis_value - 1.0) * stitched_sharpe**2 / 4.0,
+            1.0 - skewness * stitched_daily + (kurtosis_value - 1.0) * stitched_daily**2 / 4.0,
         )
     )
-    min_track = (
-        float(1.0 + (z * correction / stitched_sharpe) ** 2) if stitched_sharpe > 0 else None
-    )
+    min_track = float(1.0 + (z * correction / stitched_daily) ** 2) if stitched_daily > 0 else None
     return {
         "mode": "deflate",
         "disclaimer": DISCLAIMER,
         "n_trials": int(n_trials),
         "trial_sharpe_column": column,
-        "best_oos_sharpe": best,
-        "stitched_oos_sharpe": stitched_sharpe,
-        "trial_sharpe_variance": variance,
+        "best_trial_sharpe_annualized": best_annualized,
+        "best_trial_sharpe_daily": best_daily,
+        "stitched_sharpe_annualized": stitched_annualized,
+        "stitched_sharpe_daily": stitched_daily,
+        "trial_sharpe_variance_annualized": variance_annualized,
+        "trial_sharpe_variance_daily": variance_daily,
         "stitched_sessions": t,
         "stitched_pnl_skew": skewness,
         "stitched_pnl_kurtosis": kurtosis_value,
-        "expected_max_sharpe_benchmark": float(benchmark),
-        "psr_against_zero": psr,
-        "dsr": dsr,
+        "expected_max_sharpe_daily": float(benchmark),
+        "expected_max_sharpe_annualized": float(benchmark * math.sqrt(252.0)),
+        "stitched_psr_against_zero": stitched_psr,
+        "best_trial_dsr": best_dsr,
         "minimum_track_record_sessions_95pct": min_track,
     }
 
 
-def write_artifacts(result: dict[str, Any], out: str | Path) -> None:
+def _artifact_summary(result: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(result)
+    summary.pop("paths", None)
+    summary.pop("null_sharpe_samples", None)
+    if "distribution" in summary:
+        distribution = dict(summary["distribution"])
+        distribution.pop("sharpe_samples", None)
+        summary["distribution"] = distribution
+    return summary
+
+
+def write_artifacts(result: dict[str, Any], out: str | Path) -> dict[str, Any]:
     """Write deterministic JSON, Markdown, and a compact Sharpe histogram."""
     root = Path(out)
     root.mkdir(parents=True, exist_ok=True)
+    if "paths" in result:
+        rows = []
+        null_sharpes = result.get("null_sharpe_samples", [])
+        for index, path in enumerate(result["paths"]):
+            row = {
+                "path": index,
+                "sharpe": float(path["sharpe"]),
+                "pnl": float(path["pnl"]),
+                "max_dd_pct": float(path["max_dd_pct"]),
+            }
+            if null_sharpes:
+                row["null_sharpe"] = float(null_sharpes[index])
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(root / "paths.csv", index=False)
+    summary = _artifact_summary(result)
     (root / "montecarlo.json").write_text(
-        json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
     lines = [f"# Monte Carlo harness — {DISCLAIMER}", "", "```json"]
-    lines.append(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    lines.append(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     lines.extend(["```", ""])
     (root / "montecarlo.md").write_text("\n".join(lines))
     if "sharpe_samples" in result.get("distribution", {}):
@@ -508,7 +543,7 @@ def write_artifacts(result: dict[str, Any], out: str | Path) -> None:
     elif "paths" in result:
         values = np.asarray([item["sharpe"] for item in result["paths"]], dtype=float)
     else:
-        values = np.asarray([result.get("best_oos_sharpe", 0.0)], dtype=float)
+        values = np.asarray([result.get("best_trial_sharpe_annualized", 0.0)], dtype=float)
     plt.figure(figsize=(5, 3))
     if len(values):
         plt.hist(values, bins=min(20, max(5, len(values))))
@@ -517,3 +552,4 @@ def write_artifacts(result: dict[str, Any], out: str | Path) -> None:
     plt.tight_layout()
     plt.savefig(root / "sharpe_distribution.png", dpi=90)
     plt.close()
+    return summary

@@ -563,8 +563,8 @@ def main(argv: list[str] | None = None) -> int:
             trials = pd.read_csv(root / "trials.csv")
             pnl = load_daily_pnl(root, walkforward=True)
             mc_result = run_deflate(trials, pnl.to_numpy())
-        write_montecarlo_artifacts(mc_result, args.out)
-        print(json.dumps(mc_result, indent=2, sort_keys=True))
+        artifact_summary = write_montecarlo_artifacts(mc_result, args.out)
+        print(json.dumps(artifact_summary, indent=2, sort_keys=True))
         return 0
     if args.command == "compare":
         table = _comparison_table(args.runs)
